@@ -42,6 +42,32 @@ export interface RerankOptions {
    * the shopper wants above parts/accessories for it." Default: none.
    */
   instruction?: string;
+  /**
+   * Hard cap (ms) on the rerank API call. zerank latency is variable — usually
+   * fast, occasionally slow, and it can hang outright; without a cap a hung call
+   * hangs the whole search ("never finished"). On timeout we fall back to
+   * retrieval order (a rerank outage must only ever cost ranking quality, never
+   * a response). `0`/undefined → use the default (2500ms).
+   */
+  timeoutMs?: number;
+}
+
+/** Default hard cap on the rerank call (ms). Override per-call via opts.timeoutMs
+ *  (Restart wires it behind RERANK_TIMEOUT_MS). */
+export const DEFAULT_RERANK_TIMEOUT_MS = 2500;
+
+/** Reject `p` if it hasn't settled within `ms`; the caller treats a timeout the
+ *  same as any rerank error → retrieval-order passthrough. The underlying request
+ *  is left to settle and be GC'd (the ZeroEntropy SDK exposes no abort signal). */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  if (!(ms > 0)) return p;
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`rerank timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
 }
 
 export interface RerankResult<T> {
@@ -84,13 +110,16 @@ export async function rerank<T>(
   if (!apiKey || !query.trim() || docs.length === 0) return passthrough();
 
   try {
-    const res = await getClient(apiKey).models.rerank({
-      model: opts.model ?? 'zerank-2',
-      // zerank-2 instruction-following format (per ZeroEntropy docs): the
-      // instruction is embedded in the query via XML tags, NOT a free-text prefix.
-      query: opts.instruction ? `<query>${query}</query>\n<instruction>${opts.instruction}</instruction>` : query,
-      documents: docs.map((d) => d.text),
-    });
+    const res = await withTimeout(
+      getClient(apiKey).models.rerank({
+        model: opts.model ?? 'zerank-2',
+        // zerank-2 instruction-following format (per ZeroEntropy docs): the
+        // instruction is embedded in the query via XML tags, NOT a free-text prefix.
+        query: opts.instruction ? `<query>${query}</query>\n<instruction>${opts.instruction}</instruction>` : query,
+        documents: docs.map((d) => d.text),
+      }),
+      opts.timeoutMs ?? DEFAULT_RERANK_TIMEOUT_MS,
+    );
     let ordered = (res.results ?? [])
       .filter((r: { index: number }) => docs[r.index] !== undefined)
       .map((r: { index: number; relevance_score: number }) => ({
