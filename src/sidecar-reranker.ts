@@ -28,8 +28,9 @@
  * sidecar-embedder.ts line for line. It is duplicated rather than shared
  * because these are two independently-borrowable libs and neither may depend
  * on the other. If you change the policy here, change it there too — and see
- * EI-19306801306314710, which proposes extracting it once a third client
- * appears.
+ * EI-19310953148940030, which proposes extracting it once a third client
+ * appears (each bullet of that policy is a bug someone already paid for, so a
+ * one-sided fix is the real risk).
  */
 
 import { DEFAULT_RERANK_DTYPE, LOCAL_RERANKER_MODEL, scoreCrossEncoder } from './local-engine';
