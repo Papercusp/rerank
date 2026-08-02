@@ -37,6 +37,7 @@ vi.mock('zeroentropy', () => ({
 }));
 
 import { rerank, rerankAvailable, type RerankDoc } from './index';
+import { _setLoaderForTest } from './local-engine';
 
 const docs: Array<RerankDoc<string>> = [
   { id: 'a', text: 'alpha doc', row: 'A' },
