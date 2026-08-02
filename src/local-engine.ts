@@ -21,6 +21,13 @@
  * This file only has to be correct and fail-safe in-process.
  */
 
+import {
+  CPU_EXECUTION_TARGET,
+  type RerankDevice,
+  type RerankExecutionTarget,
+  resolveExecutionTarget,
+} from './execution-target';
+
 /** Cross-encoder that emits one logit per pair. num_labels=1, ModernBERT. */
 export const LOCAL_RERANKER_MODEL = 'Alibaba-NLP/gte-reranker-modernbert-base';
 
@@ -59,8 +66,18 @@ export const DEFAULT_BATCH_SIZE = 16;
 export interface LocalRerankOptions {
   /** HF model id. Default `LOCAL_RERANKER_MODEL`. */
   model?: string;
-  /** ONNX weight format. Default `q8` (see DEFAULT_RERANK_DTYPE). */
+  /**
+   * ONNX weight format. Defaults WITH `device` as a coherent pair (see
+   * `execution-target.ts`) — do not set this alone unless you mean to: `fp16`
+   * without a GPU `device` is not a slow configuration, it is an unloadable one.
+   */
   dtype?: string;
+  /**
+   * ONNX Runtime execution provider. Defaults WITH `dtype` as a pair. Passing a
+   * GPU device does not force it: the engine verifies the session actually
+   * constructs and falls back to the whole CPU pair if it does not.
+   */
+  device?: RerankDevice;
   /** Truncate each (query, doc) pair to this many tokens. Default 512. */
   maxLength?: number;
   /** Pairs per forward pass. Default 16. */
@@ -108,14 +125,16 @@ interface LoadedModel {
 const _models = new Map<string, Promise<LoadedModel>>();
 
 /** Injected in tests so the engine's own logic is testable without ONNX. */
-let _loaderOverride: ((model: string, dtype: string) => Promise<LoadedModel>) | null = null;
+let _loaderOverride: ((model: string, dtype: string, device: RerankDevice) => Promise<LoadedModel>) | null =
+  null;
 
-async function defaultLoader(model: string, dtype: string): Promise<LoadedModel> {
+async function defaultLoader(model: string, dtype: string, device: RerankDevice): Promise<LoadedModel> {
   const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
   const [tokenizer, classifier] = await Promise.all([
     transformers.AutoTokenizer.from_pretrained(model),
     transformers.AutoModelForSequenceClassification.from_pretrained(model, {
       dtype,
+      device,
       session_options: ORT_SESSION_OPTIONS,
     }),
   ]);
@@ -130,19 +149,80 @@ async function defaultLoader(model: string, dtype: string): Promise<LoadedModel>
  * model, a cold network) does not poison the process for its whole lifetime.
  */
 export function loadCrossEncoder(opts: LocalRerankOptions = {}): Promise<LoadedModel> {
-  const model = opts.model ?? LOCAL_RERANKER_MODEL;
-  const dtype = opts.dtype ?? DEFAULT_RERANK_DTYPE;
-  const key = `${model}::${dtype}`;
+  return loadOnTarget(opts.model ?? LOCAL_RERANKER_MODEL, effectiveTarget(opts));
+}
+
+/**
+ * Resolve the (device, dtype) PAIR for a call.
+ *
+ * The pair is the unit: when the caller says nothing we take the host's whole
+ * target, never one field from the host and one from a constant. An explicit
+ * `dtype`/`device` is still honoured (tests and experiments need to pin one),
+ * but it can only ever narrow a coherent starting point — it cannot silently
+ * produce `fp16` on the CPU provider by defaulting the other half.
+ */
+function effectiveTarget(opts: LocalRerankOptions): RerankExecutionTarget {
+  const host = resolveExecutionTarget();
+  if (opts.device === undefined && opts.dtype === undefined) return host;
+  const device = opts.device ?? host.device;
+  const dtype = opts.dtype ?? host.dtype;
+  return { device, dtype, why: 'explicit caller override' };
+}
+
+/**
+ * Has the GPU target been proven to work on this host? A GPU that is present is
+ * not a GPU that is usable — the CUDA provider fails to load without cuDNN, and
+ * the fp16 graph fails to initialise on the CPU provider. We therefore find out
+ * by CONSTRUCTING a session, and remember the answer so a broken GPU host pays
+ * the failed load once rather than on every search.
+ */
+let _gpuUnusable = false;
+
+/** Reported once per process when a GPU target is demoted, so the fallback is
+ *  visible in a log instead of silently costing quality. */
+function reportDemotion(target: RerankExecutionTarget, err: unknown): void {
+  console.warn(
+    `[rerank] ${target.device}/${target.dtype} session failed to construct — falling back to ` +
+      `${CPU_EXECUTION_TARGET.device}/${CPU_EXECUTION_TARGET.dtype}. ` +
+      `Reranking continues on CPU. Cause: ${String((err as Error)?.message ?? err).slice(0, 200)}`,
+  );
+}
+
+/**
+ * Load on `target`, falling back to the CPU PAIR — both fields together — if a
+ * non-CPU target cannot construct a session.
+ *
+ * Falling back on `device` alone would leave `dtype: 'fp16'` pointed at the CPU
+ * provider, which is the single worst configuration available and is exactly
+ * what a naive "GPU didn't work, use the CPU" retry produces.
+ */
+function loadOnTarget(model: string, target: RerankExecutionTarget): Promise<LoadedModel> {
+  const effective = target.device !== 'cpu' && _gpuUnusable ? CPU_EXECUTION_TARGET : target;
+  const key = `${model}::${effective.dtype}::${effective.device}`;
 
   const cached = _models.get(key);
   if (cached) return cached;
 
-  const loading = (_loaderOverride ?? defaultLoader)(model, dtype).catch((err) => {
-    _models.delete(key);
-    throw err;
-  });
+  const loading = (_loaderOverride ?? defaultLoader)(model, effective.dtype, effective.device).catch(
+    (err) => {
+      _models.delete(key);
+      if (effective.device === 'cpu') throw err;
+      // Demote the WHOLE pair, once, then retry on CPU.
+      _gpuUnusable = true;
+      reportDemotion(effective, err);
+      return loadOnTarget(model, CPU_EXECUTION_TARGET);
+    },
+  );
   _models.set(key, loading);
   return loading;
+}
+
+/** The pair this host will actually run on, after any verified demotion. Exposed
+ *  so a warm-model host / health check can REPORT the real configuration rather
+ *  than the requested one. */
+export function activeExecutionTarget(): RerankExecutionTarget {
+  const host = resolveExecutionTarget();
+  return host.device !== 'cpu' && _gpuUnusable ? CPU_EXECUTION_TARGET : host;
 }
 
 const sigmoid = (x: number): number => 1 / (1 + Math.exp(-x));
