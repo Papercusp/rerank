@@ -36,6 +36,21 @@ export {
   type LocalRerankOptions,
 } from './local-engine';
 
+export {
+  DEFAULT_SIDECAR_MAX_ATTEMPTS,
+  DEFAULT_SIDECAR_TIMEOUT_MS,
+  RERANK_SIDECAR_URL_ENV,
+  SIDECAR_MAX_TEXT_CHARS,
+  SidecarRerankHttpError,
+  buildSidecarFirstReranker,
+  isNonRetryableSidecarError,
+  resolveRerankSidecarUrl,
+  sidecarRerankBatch,
+  type RerankScoreFn,
+  type SidecarFirstRerankerOpts,
+  type SidecarRerankResponse,
+} from './sidecar-reranker';
+
 export interface RerankDoc<T> {
   /** Stable id (for caching / debugging). */
   id: string;
@@ -71,6 +86,16 @@ export interface RerankOptions extends LocalRerankOptions {
    * fp32 rejects too much at q8. Fit it on the dtype you deploy.
    */
   minScore?: number;
+  /**
+   * Scoring function override for `engine: 'local'` — returns scores
+   * index-aligned with the docs, and MAY throw.
+   *
+   * This is how a sidecar-backed scorer (buildSidecarFirstReranker) reaches the
+   * ranking logic without a third engine branch: whatever it throws is caught
+   * by the SAME fail-safe seam as an in-process failure, so a sidecar outage
+   * degrades to retrieval order exactly like a missing ONNX runtime does.
+   */
+  scorer?: (query: string, texts: string[]) => Promise<number[]>;
   /**
    * Instruction for an instruction-following reranker (zerank-2). The
    * ZeroEntropy SDK has no dedicated instruction field, so it's prepended to the
@@ -151,13 +176,24 @@ async function zeroEntropyScores<T>(
   }
 }
 
-/** Local ONNX cross-encoder. Returns index-aligned scores, or null. */
+/** Local cross-encoder — in-process by default, or an injected `scorer` (e.g.
+ *  the sidecar client). Returns index-aligned scores, or null to fail safe. */
 async function localScores<T>(
   query: string,
   docs: Array<RerankDoc<T>>,
   opts: RerankOptions,
 ): Promise<EngineScores> {
-  return await localEngineScores(query, docs.map((d) => d.text), opts);
+  const texts = docs.map((d) => d.text);
+  if (!opts.scorer) return await localEngineScores(query, texts, opts);
+  try {
+    const scores = await opts.scorer(query, texts);
+    // A length mismatch would misalign every score with its document, so treat
+    // it as a failure rather than ranking on garbage.
+    if (!Array.isArray(scores) || scores.length !== texts.length) return null;
+    return scores.map((s) => (typeof s === 'number' && Number.isFinite(s) ? s : undefined));
+  } catch {
+    return null;
+  }
 }
 
 /**
