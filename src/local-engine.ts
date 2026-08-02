@@ -222,7 +222,7 @@ function loadOnTarget(model: string, target: RerankExecutionTarget): Promise<Loa
       // Demote the WHOLE pair, once, then retry on CPU.
       _gpuUnusable = true;
       reportDemotion(effective, err);
-      return loadOnTarget(model, { ...effective, device: 'cpu' }); // MUTATION: device-only fallback
+      return loadOnTarget(model, CPU_EXECUTION_TARGET);
     },
   );
   _models.set(key, loading);
