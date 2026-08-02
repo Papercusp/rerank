@@ -67,6 +67,76 @@ describe('rerankAvailable', () => {
     process.env.ZEROENTROPY_API_KEY = 'env-k';
     expect(rerankAvailable()).toBe(true);
   });
+
+  it('the local engine needs no credential, so it is always available', () => {
+    expect(rerankAvailable({ engine: 'local' })).toBe(true);
+    expect(rerankAvailable({ engine: 'zeroentropy' })).toBe(false);
+  });
+});
+
+describe('engine dispatch', () => {
+  /** Fake cross-encoder: scores by the doc text, so ordering is assertable. */
+  const loaderScoring = (byText: Record<string, number>) => async () => ({
+    tokenizer: ((_text: string[], o: { text_pair: string[] }) => ({ __texts: o.text_pair })) as never,
+    model: (async (inputs: Record<string, unknown>) => {
+      const texts = inputs.__texts as string[];
+      return { logits: { dims: [texts.length, 1], data: texts.map((t) => byText[t] ?? 0) } };
+    }) as never,
+  });
+
+  afterEach(() => _setLoaderForTest(null));
+
+  it('engine:"local" reorders without any API key or API call', async () => {
+    _setLoaderForTest(loaderScoring({ 'alpha doc': -3, 'beta doc': 5, 'gamma doc': 1 }));
+
+    const out = await rerank('query', docs, { engine: 'local' });
+
+    expect(out.map((r) => r.row)).toEqual(['B', 'C', 'A']);
+    expect(out.every((r) => r.reranked === true)).toBe(true);
+    expect(out.every((r) => r.score > 0 && r.score < 1)).toBe(true);
+    expect(h.rerankCalls).toHaveLength(0);
+    expect(h.constructed).toHaveLength(0);
+  });
+
+  it('engine:"local" degrades to retrieval order when the model cannot load', async () => {
+    _setLoaderForTest(async () => {
+      throw new Error('no onnx runtime');
+    });
+
+    const out = await rerank('query', docs, { engine: 'local' });
+
+    expect(out.map((r) => r.row)).toEqual(['A', 'B', 'C']);
+    expect(out.every((r) => r.reranked === false && r.score === 0)).toBe(true);
+  });
+
+  it('topN and minScore shape the local result the same way as the hosted one', async () => {
+    _setLoaderForTest(loaderScoring({ 'alpha doc': 5, 'beta doc': 4, 'gamma doc': -5 }));
+
+    const out = await rerank('query', docs, { engine: 'local', minScore: 0.5, topN: 1 });
+
+    expect(out.map((r) => r.row)).toEqual(['A']);
+  });
+
+  it('defaults to the hosted engine, so an existing caller is unchanged', async () => {
+    h.impl = async () => ({ results: [{ index: 1, relevance_score: 0.8 }] });
+    const out = await rerank('query', docs, { apiKey: freshKey() });
+    expect(out.map((r) => r.row)).toEqual(['B']);
+    expect(h.rerankCalls).toHaveLength(1);
+  });
+});
+
+describe('tie-breaking', () => {
+  it('equal scores keep retrieval order (the first-stage ranking is the tiebreak)', async () => {
+    h.impl = async () => ({
+      results: [
+        { index: 2, relevance_score: 0.5 },
+        { index: 0, relevance_score: 0.5 },
+        { index: 1, relevance_score: 0.5 },
+      ],
+    });
+    const out = await rerank('query', docs, { apiKey: freshKey() });
+    expect(out.map((r) => r.row)).toEqual(['A', 'B', 'C']);
+  });
 });
 
 describe('passthrough triggers (fail-safe contract)', () => {
