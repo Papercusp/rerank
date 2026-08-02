@@ -179,6 +179,72 @@ describe('passthrough triggers (fail-safe contract)', () => {
   });
 });
 
+describe('scoring timeout (bounded degradation)', () => {
+  /** A scorer that takes `ms` before returning index-aligned scores for `docs`. */
+  const slowScorer =
+    (ms: number, scores: number[] = [0.1, 0.9, 0.5]) =>
+    async () => {
+      await new Promise((r) => setTimeout(r, ms));
+      return scores;
+    };
+
+  it('a scorer slower than timeoutMs degrades to retrieval order instead of stalling', async () => {
+    const started = Date.now();
+    const out = await rerank('query', docs, { engine: 'local', scorer: slowScorer(2_000), timeoutMs: 25 });
+    const elapsed = Date.now() - started;
+
+    expect(out.map((r) => r.row)).toEqual(['A', 'B', 'C']);
+    expect(out.every((r) => r.reranked === false)).toBe(true);
+    // The property that makes this a LATENCY guard and not just a fallback:
+    // the call is bounded by the timeout, NOT by how slow the scorer was.
+    expect(elapsed).toBeLessThan(1_000);
+  });
+
+  it('a scorer inside the budget still reranks — the guard never fires early', async () => {
+    const out = await rerank('query', docs, { engine: 'local', scorer: slowScorer(5), timeoutMs: 5_000 });
+    expect(out.map((r) => r.row)).toEqual(['B', 'C', 'A']);
+    expect(out.every((r) => r.reranked === true)).toBe(true);
+  });
+
+  it('timeoutMs 0 disables the bound (a batch caller may legitimately want to wait)', async () => {
+    const out = await rerank('query', docs, { engine: 'local', scorer: slowScorer(40), timeoutMs: 0 });
+    expect(out.map((r) => r.row)).toEqual(['B', 'C', 'A']);
+    expect(out.every((r) => r.reranked === true)).toBe(true);
+  });
+
+  it('degrades on timeout even when the scorer NEVER settles (the hang case)', async () => {
+    const out = await rerank('query', docs, {
+      engine: 'local',
+      scorer: () => new Promise<number[]>(() => {}),
+      timeoutMs: 25,
+    });
+    expect(out.map((r) => r.row)).toEqual(['A', 'B', 'C']);
+    expect(out.every((r) => r.reranked === false)).toBe(true);
+  });
+
+  it('a scorer that REJECTS after the timeout does not raise an unhandled rejection', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (err: unknown) => unhandled.push(err);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const out = await rerank('query', docs, {
+        engine: 'local',
+        scorer: async () => {
+          await new Promise((r) => setTimeout(r, 30));
+          throw new Error('late sidecar failure');
+        },
+        timeoutMs: 10,
+      });
+      expect(out.every((r) => r.reranked === false)).toBe(true);
+      // Let the loser reject and any unhandled-rejection report land.
+      await new Promise((r) => setTimeout(r, 80));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+});
+
 describe('reranked path', () => {
   it('reorders by the API result and carries calibrated scores', async () => {
     h.impl = async () => ({

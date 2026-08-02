@@ -107,6 +107,25 @@ export interface RerankOptions extends LocalRerankOptions {
    * degrades its scoring rather than steering it.
    */
   instruction?: string;
+  /**
+   * Wall-clock bound on SCORING. On expiry the rerank degrades through the
+   * SAME fail-safe passthrough as any other scoring failure — it never throws
+   * and never stalls the caller. Default {@link DEFAULT_RERANK_TIMEOUT_MS};
+   * `0`/`Infinity` disables it.
+   *
+   * ⚠ This is a BACKSTOP against a hang, deliberately NOT a UX budget. It sits
+   * ABOVE the sidecar client's own 15s retry budget (DEFAULT_SIDECAR_TIMEOUT_MS)
+   * so it can never pre-empt that retry policy and convert a recoverable blip
+   * into a silent degradation. A user-facing caller wanting search-grade
+   * latency must pass its OWN, much tighter value — the right bound depends on
+   * the caller's latency contract, which this library cannot know.
+   *
+   * The losing promise is not cancellable (neither ONNX inference nor an
+   * in-flight fetch aborts here), so it runs to completion in the background
+   * and its result is discarded; a late rejection is swallowed rather than
+   * surfacing as an unhandled rejection after we have already degraded.
+   */
+  timeoutMs?: number;
 }
 
 export interface RerankResult<T> {
@@ -202,6 +221,47 @@ async function localScores<T>(
  * returns `docs` in original order (reranked=false) so callers can always use
  * the result safely.
  */
+/**
+ * Backstop bound on scoring (ms). Deliberately ABOVE the sidecar client's own
+ * 15s retry budget so it never truncates that retry policy — this catches a
+ * genuine HANG (a wedged in-process engine, a scorer that never settles), not
+ * a slow-but-progressing rerank. Callers with a latency contract (a user-facing
+ * search route) pass their own, tighter `timeoutMs`.
+ */
+export const DEFAULT_RERANK_TIMEOUT_MS = 20_000;
+
+/** Distinguishes "the timer won" from a legitimate `null` scoring result. */
+const SCORE_TIMEOUT = Symbol('rerank-score-timeout');
+
+/**
+ * Resolve `scores`, or `null` if `timeoutMs` elapses first — `null` is exactly
+ * what the engines already return when they cannot score, so a timeout reuses
+ * the single fail-safe passthrough instead of adding a second degradation path.
+ */
+async function withScoreTimeout(scores: Promise<EngineScores>, timeoutMs: number): Promise<EngineScores> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return scores;
+
+  // The race loser keeps running (inference/fetch are not cancellable here). If
+  // it later REJECTS with nobody awaiting it, Node reports an unhandled
+  // rejection — attach the sink now, before racing, so there is no window.
+  scores.catch(() => {});
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const winner = await Promise.race([
+      scores,
+      new Promise<typeof SCORE_TIMEOUT>((resolve) => {
+        timer = setTimeout(() => resolve(SCORE_TIMEOUT), timeoutMs);
+      }),
+    ]);
+    return winner === SCORE_TIMEOUT ? null : winner;
+  } finally {
+    // Always clear: a surviving timer would hold the event loop open for up to
+    // timeoutMs after a fast rerank already returned.
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export async function rerank<T>(
   query: string,
   docs: Array<RerankDoc<T>>,
@@ -212,8 +272,10 @@ export async function rerank<T>(
 
   if (!query.trim() || docs.length === 0) return passthrough();
 
-  const scores =
-    opts.engine === 'local' ? await localScores(query, docs, opts) : await zeroEntropyScores(query, docs, opts);
+  const scores = await withScoreTimeout(
+    opts.engine === 'local' ? localScores(query, docs, opts) : zeroEntropyScores(query, docs, opts),
+    opts.timeoutMs ?? DEFAULT_RERANK_TIMEOUT_MS,
+  );
   if (!scores) return passthrough();
 
   let ordered = docs
