@@ -50,8 +50,20 @@ export const FAST_RERANKER_MODEL = 'Xenova/ms-marco-MiniLM-L-6-v2';
  */
 export const ORT_SESSION_OPTIONS = { intraOpNumThreads: 4, interOpNumThreads: 1 } as const;
 
-/** q8 is the CPU-correct default. fp16/q4f16 are GPU formats and PESSIMIZE on
- *  x86 (no native fp16 compute — ORT casts to fp32 and pays the conversion). */
+/**
+ * q8 is the CPU-correct default, MEASURED rather than assumed (plan D-006): on
+ * 4 pinned cores it is 1.60x faster per pair than fp32 and never changed the
+ * top result (top-1 agreement 1.000 across 6 queries, NDCG@5 0.9855).
+ *
+ * fp16/q4f16 are GPU formats. On the CPU provider fp16 is not merely slower —
+ * the graph FAILS TO INITIALISE outright (ORT's precision-free-cast insertion
+ * breaks on ModernBERT's SimplifiedLayerNormFusion), so the engine's fail-safe
+ * would silently drop reranking entirely. That is why dtype is chosen as a PAIR
+ * with the execution provider; see `execution-target.ts`.
+ *
+ * Prefer `resolveExecutionTarget()` over this constant — it is retained for the
+ * callers that legitimately pin a dtype (tests, benchmarks).
+ */
 export const DEFAULT_RERANK_DTYPE = 'q8';
 
 /** Pairs are truncated to this many tokens. The model supports 8192, but a
@@ -210,7 +222,7 @@ function loadOnTarget(model: string, target: RerankExecutionTarget): Promise<Loa
       // Demote the WHOLE pair, once, then retry on CPU.
       _gpuUnusable = true;
       reportDemotion(effective, err);
-      return loadOnTarget(model, CPU_EXECUTION_TARGET);
+      return loadOnTarget(model, { ...effective, device: 'cpu' }); // MUTATION: device-only fallback
     },
   );
   _models.set(key, loading);
@@ -319,10 +331,16 @@ export async function localRerankAvailable(): Promise<boolean> {
   }
 }
 
-/** Test seam — inject a fake loader and drop every warm model. */
+/** Test seam — inject a fake loader and drop every warm model.
+ *
+ *  Also clears the remembered GPU verdict: it is process-lifetime state by
+ *  design (a broken GPU host must not re-pay a failed load per search), which
+ *  would otherwise leak between tests and make a demotion test pass only when
+ *  it happened to run first. */
 export function _setLoaderForTest(
-  loader: ((model: string, dtype: string) => Promise<LoadedModel>) | null,
+  loader: ((model: string, dtype: string, device: RerankDevice) => Promise<LoadedModel>) | null,
 ): void {
   _loaderOverride = loader;
   _models.clear();
+  _gpuUnusable = false;
 }

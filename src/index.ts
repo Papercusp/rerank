@@ -30,11 +30,24 @@ export {
   FAST_RERANKER_MODEL,
   LOCAL_RERANKER_MODEL,
   ORT_SESSION_OPTIONS,
+  activeExecutionTarget,
   loadCrossEncoder,
   localRerankAvailable,
   scoreCrossEncoder,
   type LocalRerankOptions,
 } from './local-engine';
+
+export {
+  CPU_EXECUTION_TARGET,
+  CUDA_EXECUTION_TARGET,
+  RERANK_DEVICE_ENV,
+  WEBGPU_EXECUTION_TARGET,
+  executionTargetFor,
+  isCoherentTarget,
+  resolveExecutionTarget,
+  type RerankDevice,
+  type RerankExecutionTarget,
+} from './execution-target';
 
 export {
   DEFAULT_SIDECAR_MAX_ATTEMPTS,

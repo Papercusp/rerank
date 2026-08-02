@@ -33,7 +33,7 @@
  * one-sided fix is the real risk).
  */
 
-import { DEFAULT_RERANK_DTYPE, LOCAL_RERANKER_MODEL, scoreCrossEncoder } from './local-engine';
+import { LOCAL_RERANKER_MODEL, scoreCrossEncoder } from './local-engine';
 
 /** Scores `texts` against `query`, index-aligned. Throws on failure. */
 export type RerankScoreFn = (query: string, texts: string[]) => Promise<number[]>;
@@ -178,12 +178,19 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
 
   if (!url) {
     // No sidecar configured: the in-process engine is the sole engine.
+    //
+    // `dtype` is forwarded ONLY when the caller actually set one. Defaulting it
+    // here to DEFAULT_RERANK_DTYPE would look harmless but would break the
+    // (device, dtype) pair: an explicitly-set dtype makes the engine treat the
+    // call as a caller override and take `device` from the host, so on a GPU
+    // host this line would silently request q8 weights on the CUDA provider.
+    // Passing nothing lets the engine resolve the whole coherent pair.
     const local =
       opts.localScorer ??
       ((query: string, texts: string[]) =>
         scoreCrossEncoder(query, texts, {
           model: opts.localModel ?? LOCAL_RERANKER_MODEL,
-          dtype: opts.dtype ?? DEFAULT_RERANK_DTYPE,
+          ...(opts.dtype === undefined ? {} : { dtype: opts.dtype }),
         }));
     return local;
   }
