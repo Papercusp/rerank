@@ -36,7 +36,7 @@ vi.mock('zeroentropy', () => ({
   },
 }));
 
-import { rerank, rerankAvailable, type RerankDoc } from './index';
+import { buildSidecarFirstReranker, rerank, rerankAvailable, type RerankDoc } from './index';
 import { _setLoaderForTest } from './local-engine';
 
 const docs: Array<RerankDoc<string>> = [
@@ -173,6 +173,32 @@ describe('engine dispatch', () => {
       // Wall-clock is the weakest of the three (a loaded box can stretch it), so
       // it is asserted only against the full 4-batch cost it must beat.
       expect(elapsed).toBeLessThan(BLOCK_MS * 4);
+    });
+
+    /**
+     * The branch above is NOT the one production takes. The operator always
+     * injects a scorer (`buildSidecarAwareReranker`), so `rerank()` goes through
+     * `opts.scorer` — and with no sidecar configured THAT scorer is the
+     * in-process cross-encoder. This pins the deadline actually reaching it,
+     * because a fix that stopped at the un-injected branch would pass every
+     * other test here while leaving the shipped desktop path unbounded.
+     */
+    it('carries the deadline into the in-process fallback behind a sidecar-first scorer', async () => {
+      const counter = { batches: 0 };
+      _setLoaderForTest(blockingLoader(counter));
+
+      // url: null ⇒ "no sidecar configured" ⇒ the in-process engine is the sole
+      // engine. This is the desktop install's exact wiring.
+      const scorer = buildSidecarFirstReranker({ url: null });
+
+      await expect(
+        scorer('query', ['a doc', 'b doc'], { deadline: Date.now() - 1 }),
+      ).rejects.toThrow(/deadline exceeded/);
+      expect(counter.batches).toBe(0); // refused before holding the thread at all
+
+      // ...and with headroom it scores normally through the same seam.
+      const scores = await scorer('query', ['a doc', 'b doc'], { deadline: Date.now() + 10_000 });
+      expect(scores).toHaveLength(2);
     });
 
     it('still scores normally when the work fits inside the bound', async () => {

@@ -218,7 +218,17 @@ async function localScores<T>(
   const texts = docs.map((d) => d.text);
   if (!opts.scorer) return await localEngineScores(query, texts, opts);
   try {
-    const scores = await opts.scorer(query, texts);
+    // Forward the deadline: the production wiring ALWAYS takes this branch (the
+    // operator injects a sidecar-first scorer), and with no sidecar that scorer
+    // is the in-process cross-encoder. Omitting it here would leave the shipped
+    // desktop path — the only one with the defect — still unbounded.
+    // The third argument is passed ONLY when there is a deadline to pass, so a
+    // scorer (or a test spy) that expects the original two-arg shape sees it
+    // unchanged.
+    const scores =
+      opts.deadline === undefined
+        ? await opts.scorer(query, texts)
+        : await opts.scorer(query, texts, { deadline: opts.deadline });
     // A length mismatch would misalign every score with its document, so treat
     // it as a failure rather than ranking on garbage.
     if (!Array.isArray(scores) || scores.length !== texts.length) return null;

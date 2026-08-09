@@ -35,8 +35,30 @@
 
 import { LOCAL_RERANKER_MODEL, scoreCrossEncoder } from './local-engine';
 
+/**
+ * Per-call scoring controls. Optional so that every existing
+ * `(query, texts) => …` scorer still satisfies {@link RerankScoreFn} unchanged.
+ */
+export interface RerankScoreCallOpts {
+  /**
+   * Absolute epoch-ms instant after which scoring should STOP.
+   *
+   * Honoured by the in-process engine, which is the one that needs it: it holds
+   * the thread, so an abandoned call keeps burning a core until it finishes.
+   * The sidecar path ignores it deliberately — that call is genuinely async and
+   * already bounded by its own retry budget, and re-bounding it here would
+   * truncate that retry policy (EI-20005411672741677 is about the in-process
+   * path only; the sidecar path was never broken and must not regress).
+   */
+  deadline?: number;
+}
+
 /** Scores `texts` against `query`, index-aligned. Throws on failure. */
-export type RerankScoreFn = (query: string, texts: string[]) => Promise<number[]>;
+export type RerankScoreFn = (
+  query: string,
+  texts: string[],
+  opts?: RerankScoreCallOpts,
+) => Promise<number[]>;
 
 /** The SAME env var the embedder uses — one sidecar process serves both. */
 export const RERANK_SIDECAR_URL_ENV = 'PAPERCUSP_EMBED_SIDECAR_URL';
@@ -187,10 +209,17 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
     // Passing nothing lets the engine resolve the whole coherent pair.
     const local =
       opts.localScorer ??
-      ((query: string, texts: string[]) =>
+      ((query: string, texts: string[], callOpts?: RerankScoreCallOpts) =>
         scoreCrossEncoder(query, texts, {
           model: opts.localModel ?? LOCAL_RERANKER_MODEL,
           ...(opts.dtype === undefined ? {} : { dtype: opts.dtype }),
+          // THE path EI-20005411672741677 is about: no sidecar ⇒ this in-process
+          // engine holds the main thread. Forwarding the caller's deadline is
+          // what lets it stop scoring once the caller has already degraded,
+          // instead of running on unwatched. Without this line the deadline
+          // reaches every direct `localEngineScores` caller but NOT the shipped
+          // desktop path, which is the only one that actually has the problem.
+          ...(callOpts?.deadline === undefined ? {} : { deadline: callOpts.deadline }),
         }));
     return local;
   }
