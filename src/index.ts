@@ -285,9 +285,23 @@ export async function rerank<T>(
 
   if (!query.trim() || docs.length === 0) return passthrough();
 
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_RERANK_TIMEOUT_MS;
+
+  // Give the in-process engine the SAME instant the race is measuring against,
+  // so it can stop scoring rather than run on unwatched after we degrade. The
+  // race alone cannot do this: its loser is not cancellable. Only the local
+  // engine is ours to stop — a hosted HTTP call is bounded by its own client,
+  // and an injected `scorer` belongs to the caller.
+  const scoringOpts: RerankOptions =
+    opts.engine === 'local' && Number.isFinite(timeoutMs) && timeoutMs > 0 && opts.deadline === undefined
+      ? { ...opts, deadline: Date.now() + timeoutMs }
+      : opts;
+
   const scores = await withScoreTimeout(
-    opts.engine === 'local' ? localScores(query, docs, opts) : zeroEntropyScores(query, docs, opts),
-    opts.timeoutMs ?? DEFAULT_RERANK_TIMEOUT_MS,
+    opts.engine === 'local'
+      ? localScores(query, docs, scoringOpts)
+      : zeroEntropyScores(query, docs, scoringOpts),
+    timeoutMs,
   );
   if (!scores) return passthrough();
 

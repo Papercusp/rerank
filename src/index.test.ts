@@ -109,6 +109,85 @@ describe('engine dispatch', () => {
     expect(out.every((r) => r.reranked === false && r.score === 0)).toBe(true);
   });
 
+  /**
+   * RECURRENCE GUARD for EI-20005411672741677 — the `timeoutMs` bound must be
+   * ENFORCEABLE against an in-process engine, not merely declared.
+   *
+   * Every bound in this lib is `Promise.race` + `setTimeout`, and a timer cannot
+   * preempt a stage that blocks the event loop. The local cross-encoder runs
+   * in-process on the main thread wherever no embed sidecar is configured (the
+   * desktop install — the shipping target), so before the fix NONE of these
+   * bounds could fire there: measured on the sibling corpus path, a 2,000ms
+   * bound was overrun to 2,473ms while still reporting success.
+   *
+   * The fake model below blocks the loop exactly the way real ONNX inference
+   * does, so the assertion is on the OBSERVABLE contract rather than on
+   * wall-clock: if the timer cannot fire, scoring runs to completion and the
+   * call returns a REORDERED result (reranked: true). Enforcement is therefore
+   * visible as the degrade — a behavioural difference, not a timing threshold,
+   * so it cannot go flaky under fleet load.
+   */
+  describe('the timeout bound survives a loop-blocking in-process engine', () => {
+    const BLOCK_MS = 40;
+
+    /** A cross-encoder whose forward pass BLOCKS the event loop, as ONNX does. */
+    const blockingLoader = (counter: { batches: number }) => async () => ({
+      tokenizer: ((_t: string[], o: { text_pair: string[] }) => ({ __texts: o.text_pair })) as never,
+      model: (async (inputs: Record<string, unknown>) => {
+        counter.batches += 1;
+        const until = Date.now() + BLOCK_MS;
+        while (Date.now() < until) {
+          /* busy-wait: hold the thread, exactly like a synchronous forward pass */
+        }
+        const texts = inputs.__texts as string[];
+        return { logits: { dims: [texts.length, 1], data: texts.map(() => 1) } };
+      }) as never,
+    });
+
+    it('degrades to retrieval order instead of running every batch to completion', async () => {
+      const counter = { batches: 0 };
+      _setLoaderForTest(blockingLoader(counter));
+
+      // 4 docs at one pair per pass = 4 blocking batches ≈ 160ms of held thread,
+      // against a 50ms bound. A bound that cannot fire scores all four and wins
+      // the race; an enforceable one degrades partway through.
+      const many: Array<RerankDoc<string>> = ['A', 'B', 'C', 'D'].map((row) => ({
+        id: row,
+        text: `${row} doc`,
+        row,
+      }));
+
+      const startedAt = Date.now();
+      const out = await rerank('query', many, { engine: 'local', batchSize: 1, timeoutMs: 50 });
+      const elapsed = Date.now() - startedAt;
+      const batchesAtReturn = counter.batches;
+
+      // THE GUARD: the bound won, so the caller got the fail-safe passthrough.
+      expect(out.every((r) => r.reranked === false && r.score === 0)).toBe(true);
+      expect(out.map((r) => r.row)).toEqual(['A', 'B', 'C', 'D']);
+
+      // ...and it won BEFORE the engine had chewed through every batch, which is
+      // what distinguishes a real bound from one that merely reports lateness.
+      expect(batchesAtReturn).toBeLessThan(4);
+
+      // Wall-clock is the weakest of the three (a loaded box can stretch it), so
+      // it is asserted only against the full 4-batch cost it must beat.
+      expect(elapsed).toBeLessThan(BLOCK_MS * 4);
+    });
+
+    it('still scores normally when the work fits inside the bound', async () => {
+      const counter = { batches: 0 };
+      _setLoaderForTest(blockingLoader(counter));
+
+      // One batch of 40ms against a 4s bound: the yield must not cost correctness.
+      const out = await rerank('query', docs, { engine: 'local', timeoutMs: 4_000 });
+
+      expect(out.every((r) => r.reranked === true)).toBe(true);
+      expect(out).toHaveLength(3);
+      expect(counter.batches).toBe(1);
+    });
+  });
+
   it('topN and minScore shape the local result the same way as the hosted one', async () => {
     _setLoaderForTest(loaderScoring({ 'alpha doc': 5, 'beta doc': 4, 'gamma doc': -5 }));
 

@@ -94,6 +94,20 @@ export interface LocalRerankOptions {
   maxLength?: number;
   /** Pairs per forward pass. Default 16. */
   batchSize?: number;
+  /**
+   * Absolute epoch-ms instant after which scoring STOPS, checked between
+   * batches. Throws on expiry, which `localEngineScores` converts to the same
+   * fail-safe `null` as any other scoring failure — so an over-budget rerank
+   * degrades to retrieval order rather than running to completion unwatched.
+   *
+   * Distinct from the caller's `timeoutMs` and NOT a replacement for it. That
+   * one bounds how long the CALLER waits; this one stops the WORK. Both are
+   * needed because the losing side of a `Promise.race` is not cancellable: with
+   * only the race, an abandoned rerank keeps burning a core for the rest of its
+   * natural life, on the very host (no sidecar ⇒ in-process) least able to
+   * spare one. `rerank()` derives this from `timeoutMs` automatically.
+   */
+  deadline?: number;
 }
 
 // --- Minimal structural types for the optional dependency ------------------
@@ -259,11 +273,45 @@ function scoreFromLogits(row: number[]): number {
 }
 
 /**
+ * Hand the event loop a turn.
+ *
+ * `setImmediate` fires in the CHECK phase, which the loop reaches only after
+ * passing through the TIMERS phase — so this is what lets an armed `setTimeout`
+ * (every wall-clock bound in this lib is one) actually run. `await`-ing an
+ * already-resolved promise would NOT do it: that only queues a microtask, and
+ * the microtask queue is drained to empty before the loop advances a phase, so
+ * a loop of `await` over synchronous work starves timers exactly as a bare
+ * `while` loop would. That distinction IS the bug this yield fixes.
+ *
+ * Falls back to `setTimeout(0)` where `setImmediate` is absent (browser/worker
+ * builds); this lib is deliberately environment-agnostic.
+ */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (typeof setImmediate === 'function') setImmediate(resolve);
+    else setTimeout(resolve, 0);
+  });
+}
+
+/**
  * Score every (query, text) pair. Returns scores index-aligned with `texts`.
  *
  * Throws on load/inference failure — the fail-safe conversion to "return the
  * input order untouched" happens in the engine wrapper below, so a caller that
  * wants to SEE the failure (a warm-up probe, a health check, the sidecar) can.
+ *
+ * ⚠ COOPERATIVE, BY NECESSITY (EI-20005411672741677). A cross-encoder forward
+ * pass is CPU-bound and holds the thread, so while it runs nothing else on this
+ * process makes progress — including the `setTimeout` behind every one of this
+ * lib's wall-clock bounds. A timer cannot preempt it; there is no third option
+ * between "the work yields" and "the work runs elsewhere". So the loop yields
+ * between batches and re-checks its deadline there, which bounds the caller's
+ * wait to at most ONE batch of overrun instead of the whole stage.
+ *
+ * That granularity is the honest limit of this approach: a single batch still
+ * blocks. Making the bound exact needs the model on a worker thread (as the
+ * local EMBEDDER already does — `local-embedder-worker.ts`), which is tracked
+ * separately; this makes the bound real, not perfect.
  */
 export async function scoreCrossEncoder(
   query: string,
@@ -275,9 +323,21 @@ export async function scoreCrossEncoder(
   const { tokenizer, model } = await loadCrossEncoder(opts);
   const maxLength = opts.maxLength ?? DEFAULT_MAX_LENGTH;
   const batchSize = Math.max(1, opts.batchSize ?? DEFAULT_BATCH_SIZE);
+  const { deadline } = opts;
 
   const scores: number[] = [];
   for (let start = 0; start < texts.length; start += batchSize) {
+    // Before each pass, not after: the yield has to precede the thread-holding
+    // work for a bound armed by the caller to have any chance of firing, and
+    // the deadline is only meaningful once the loop has actually been given a
+    // turn to notice time passing.
+    await yieldToEventLoop();
+    if (deadline !== undefined && Date.now() >= deadline) {
+      throw new Error(
+        `rerank: scoring deadline exceeded after ${start} of ${texts.length} pairs — degrading to retrieval order`,
+      );
+    }
+
     const batch = texts.slice(start, start + batchSize);
     const inputs = tokenizer(
       // The cross-encoder scores a PAIR: the query is repeated against each doc.
