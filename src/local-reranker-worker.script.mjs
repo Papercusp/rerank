@@ -78,6 +78,16 @@ async function score(msg) {
   const { query, texts, model, dtype, device, maxLength, batchSize, deadline } = msg;
   if (texts.length === 0) return [];
 
+  // Check the deadline BEFORE loading, not just between batches: a model load is
+  // seconds on a cold cache, so loading first would spend the entire (already
+  // expired) budget before noticing there was none left.
+  const expired = () => deadline !== undefined && Date.now() >= deadline;
+  if (expired()) {
+    throw new Error(
+      `rerank: scoring deadline exceeded after 0 of ${texts.length} pairs — degrading to retrieval order`,
+    );
+  }
+
   const { tokenizer, model: classifier } = await getModel(model, dtype, device);
   const size = Math.max(1, batchSize);
   const scores = [];
@@ -88,7 +98,7 @@ async function score(msg) {
     // without this the worker would keep burning a core scoring a result nobody
     // will ever read — on exactly the host (no sidecar ⇒ in-process) least able
     // to spare one.
-    if (deadline !== undefined && Date.now() >= deadline) {
+    if (expired()) {
       throw new Error(
         `rerank: scoring deadline exceeded after ${start} of ${texts.length} pairs — degrading to retrieval order`,
       );
