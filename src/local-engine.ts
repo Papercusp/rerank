@@ -27,6 +27,7 @@ import {
   type RerankExecutionTarget,
   resolveExecutionTarget,
 } from './execution-target';
+import { getRerankWorkerState, scoreViaWorker, warnRerankFallback } from './local-reranker-worker';
 
 /** Cross-encoder that emits one logit per pair. num_labels=1, ModernBERT. */
 export const LOCAL_RERANKER_MODEL = 'Alibaba-NLP/gte-reranker-modernbert-base';
@@ -300,20 +301,20 @@ function yieldToEventLoop(): Promise<void> {
  * input order untouched" happens in the engine wrapper below, so a caller that
  * wants to SEE the failure (a warm-up probe, a health check, the sidecar) can.
  *
- * ⚠ COOPERATIVE, BY NECESSITY (EI-20005411672741677). A cross-encoder forward
- * pass is CPU-bound and holds the thread, so while it runs nothing else on this
- * process makes progress — including the `setTimeout` behind every one of this
- * lib's wall-clock bounds. A timer cannot preempt it; there is no third option
- * between "the work yields" and "the work runs elsewhere". So the loop yields
- * between batches and re-checks its deadline there, which bounds the caller's
- * wait to at most ONE batch of overrun instead of the whole stage.
+ * ⚠ COOPERATIVE WHEN INLINE (EI-20005411672741677). A cross-encoder forward pass
+ * is CPU-bound and holds the thread, so while it runs on the MAIN thread nothing
+ * else in this process makes progress — including the `setTimeout` behind every
+ * one of this lib's wall-clock bounds. A timer cannot preempt it; there is no
+ * third option between "the work yields" and "the work runs elsewhere". So the
+ * inline loop yields between batches and re-checks its deadline there, bounding
+ * the caller's wait to at most ONE batch of overrun instead of the whole stage.
  *
- * That granularity is the honest limit of this approach: a single batch still
- * blocks. Making the bound exact needs the model on a worker thread (as the
- * local EMBEDDER already does — `local-embedder-worker.ts`), which is tracked
- * separately; this makes the bound real, not perfect.
+ * The preferred path takes the third option: `scoreCrossEncoder` dispatches to a
+ * WORKER THREAD (`local-reranker-worker.ts`, WI-37555), which makes the caller's
+ * bound EXACT rather than bounded-to-one-batch. This inline function remains the
+ * fallback for hosts where a worker cannot spawn — degraded, never broken.
  */
-export async function scoreCrossEncoder(
+export async function scoreCrossEncoderInline(
   query: string,
   texts: string[],
   opts: LocalRerankOptions = {},
@@ -360,6 +361,57 @@ export async function scoreCrossEncoder(
     }
   }
   return scores;
+}
+
+/**
+ * Score every (query, text) pair, PREFERRING a worker thread.
+ *
+ * This is the exported entry point every caller already used; the dispatch is
+ * deliberately invisible to them, so the sidecar, the warm-model host and
+ * `localEngineScores` all get the exact bound with no wiring change.
+ *
+ * Two cases take the inline path, both on purpose:
+ *  - a `_setLoaderForTest` override is installed. An injected loader is an
+ *    in-process JavaScript object; it cannot cross a thread boundary, so
+ *    routing it to the worker would not merely fail, it would silently start
+ *    exercising the REAL ONNX model in tests that believe they injected a fake.
+ *  - the worker is unavailable or failed. Degraded (bound accurate only to one
+ *    batch), never broken.
+ */
+export async function scoreCrossEncoder(
+  query: string,
+  texts: string[],
+  opts: LocalRerankOptions = {},
+): Promise<number[]> {
+  if (texts.length === 0) return [];
+
+  if (_loaderOverride === null && !getRerankWorkerState().disabled) {
+    // Resolve the (device, dtype) pair HERE — including any verified GPU
+    // demotion — so that logic lives in one place rather than being duplicated
+    // across the thread seam.
+    const target = effectiveTarget(opts);
+    const effective = target.device !== 'cpu' && _gpuUnusable ? CPU_EXECUTION_TARGET : target;
+    try {
+      return await scoreViaWorker({
+        query,
+        texts,
+        model: opts.model ?? LOCAL_RERANKER_MODEL,
+        dtype: effective.dtype,
+        device: effective.device,
+        maxLength: opts.maxLength ?? DEFAULT_MAX_LENGTH,
+        batchSize: Math.max(1, opts.batchSize ?? DEFAULT_BATCH_SIZE),
+        deadline: opts.deadline,
+      });
+    } catch (err) {
+      // A deadline expiry is a real verdict from the worker, not a worker
+      // fault: re-running it inline would burn the very budget that just
+      // expired, on the main thread, which is the opposite of the fix.
+      if (err instanceof Error && /deadline exceeded/.test(err.message)) throw err;
+      warnRerankFallback(err);
+    }
+  }
+
+  return await scoreCrossEncoderInline(query, texts, opts);
 }
 
 /**
