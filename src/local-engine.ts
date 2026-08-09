@@ -155,6 +155,21 @@ const _models = new Map<string, Promise<LoadedModel>>();
 let _loaderOverride: ((model: string, dtype: string, device: RerankDevice) => Promise<LoadedModel>) | null =
   null;
 
+/**
+ * Test-only: permit the WORKER path even while a loader override is installed.
+ *
+ * Normally an injected loader forces the inline path (it is an in-process object
+ * and cannot cross a thread boundary). That rule makes the worker→inline
+ * FALLBACK unreachable from tests, because the override short-circuits before
+ * the worker is ever tried — so this seam exists purely to exercise "the worker
+ * failed, did we degrade correctly?" against a fake model. Production never
+ * installs a loader override, so this combination cannot occur outside tests.
+ */
+let _workerWithLoaderForTest = false;
+export function _setWorkerWithLoaderForTest(enabled: boolean): void {
+  _workerWithLoaderForTest = enabled;
+}
+
 async function defaultLoader(model: string, dtype: string, device: RerankDevice): Promise<LoadedModel> {
   const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
   const [tokenizer, classifier] = await Promise.all([
@@ -385,7 +400,7 @@ export async function scoreCrossEncoder(
 ): Promise<number[]> {
   if (texts.length === 0) return [];
 
-  if (_loaderOverride === null && !getRerankWorkerState().disabled) {
+  if ((_loaderOverride === null || _workerWithLoaderForTest) && !getRerankWorkerState().disabled) {
     // Resolve the (device, dtype) pair HERE — including any verified GPU
     // demotion — so that logic lives in one place rather than being duplicated
     // across the thread seam.
@@ -455,4 +470,7 @@ export function _setLoaderForTest(
   _loaderOverride = loader;
   _models.clear();
   _gpuUnusable = false;
+  // Reset the worker-dispatch escape too, so a test that enabled it cannot leak
+  // the worker path into an unrelated later test via the shared afterEach.
+  _workerWithLoaderForTest = false;
 }
