@@ -22,6 +22,7 @@
 import ZeroEntropy from 'zeroentropy';
 
 import { type LocalRerankOptions, localEngineScores } from './local-engine';
+import type { RerankScoreFn } from './sidecar-reranker';
 
 export {
   DEFAULT_BATCH_SIZE,
@@ -107,8 +108,13 @@ export interface RerankOptions extends LocalRerankOptions {
    * ranking logic without a third engine branch: whatever it throws is caught
    * by the SAME fail-safe seam as an in-process failure, so a sidecar outage
    * degrades to retrieval order exactly like a missing ONNX runtime does.
+   *
+   * Typed as {@link RerankScoreFn} rather than re-declared inline, so the
+   * optional deadline argument cannot drift between the two spellings — the
+   * inline copy is what made this field silently two-arity while the exported
+   * contract had grown a third.
    */
-  scorer?: (query: string, texts: string[]) => Promise<number[]>;
+  scorer?: RerankScoreFn;
   /**
    * Instruction for an instruction-following reranker (zerank-2). The
    * ZeroEntropy SDK has no dedicated instruction field, so it's prepended to the
