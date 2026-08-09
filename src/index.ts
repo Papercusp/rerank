@@ -35,8 +35,16 @@ export {
   loadCrossEncoder,
   localRerankAvailable,
   scoreCrossEncoder,
+  scoreCrossEncoderInline,
   type LocalRerankOptions,
 } from './local-engine';
+
+export {
+  getRerankWorkerState,
+  scoreViaWorker,
+  shutdownLocalReranker,
+  type ScoreViaWorkerRequest,
+} from './local-reranker-worker';
 
 export {
   CPU_EXECUTION_TARGET,
