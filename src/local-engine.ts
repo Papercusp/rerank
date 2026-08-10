@@ -28,6 +28,7 @@ import {
   resolveExecutionTarget,
 } from './execution-target';
 import { getRerankWorkerState, scoreViaWorker, warnRerankFallback } from './local-reranker-worker';
+import { isDeadlineFailure, runInScorerGate } from './scorer-gate';
 
 /** Cross-encoder that emits one logit per pair. num_labels=1, ModernBERT. */
 export const LOCAL_RERANKER_MODEL = 'Alibaba-NLP/gte-reranker-modernbert-base';
@@ -400,6 +401,22 @@ export async function scoreCrossEncoder(
 ): Promise<number[]> {
   if (texts.length === 0) return [];
 
+  // ONE shared scorer, so admission is decided here rather than per engine path:
+  // both the worker and the inline fallback contend for the same CPU, and this
+  // is the single funnel they both pass through. See `scorer-gate.ts` for the
+  // measurement — concurrency buys no throughput, so serializing costs nothing
+  // and lets a call that provably cannot meet its budget shed at ~0ms instead of
+  // spending the whole budget discovering it (WI-37676).
+  return await runInScorerGate(texts.length, opts.deadline, () =>
+    scoreCrossEncoderUngated(query, texts, opts),
+  );
+}
+
+async function scoreCrossEncoderUngated(
+  query: string,
+  texts: string[],
+  opts: LocalRerankOptions,
+): Promise<number[]> {
   if ((_loaderOverride === null || _workerWithLoaderForTest) && !getRerankWorkerState().disabled) {
     // Resolve the (device, dtype) pair HERE — including any verified GPU
     // demotion — so that logic lives in one place rather than being duplicated
@@ -421,7 +438,7 @@ export async function scoreCrossEncoder(
       // A deadline expiry is a real verdict from the worker, not a worker
       // fault: re-running it inline would burn the very budget that just
       // expired, on the main thread, which is the opposite of the fix.
-      if (err instanceof Error && /deadline exceeded/.test(err.message)) throw err;
+      if (isDeadlineFailure(err)) throw err;
       warnRerankFallback(err);
     }
   }

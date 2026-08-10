@@ -323,6 +323,26 @@ describe('onDegrade — every passthrough names itself', () => {
     expect(seen).toEqual(['scoring-failed']);
   });
 
+  it('a scorer that missed its DEADLINE reports `timeout`, NOT `scoring-failed`', async () => {
+    // The pair above is the control for this one, and the distinction is the
+    // whole reason these reasons exist: `scoring-failed` says the engine is
+    // broken (investigate the engine), `timeout` says the stage was too slow
+    // for this budget (raise the budget, cut candidates, or reduce in-flight
+    // concurrency). An admission SHED — the gate refusing a job at ~0ms because
+    // the shared scorer provably cannot finish it in time (WI-37676) — arrives
+    // by exactly this route, and reporting it as an outage would send every
+    // reader to debug an engine that is working perfectly.
+    await rerank('query', docs, {
+      engine: 'local',
+      scorer: async () => {
+        throw new Error('rerank: scoring deadline exceeded after 0 of 3 pairs');
+      },
+      timeoutMs: 5_000,
+      onDegrade,
+    });
+    expect(seen).toEqual(['timeout']);
+  });
+
   it('a blank query reports `empty-input`', async () => {
     await rerank('   ', docs, { apiKey: freshKey(), onDegrade });
     expect(seen).toEqual(['empty-input']);

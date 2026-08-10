@@ -21,8 +21,17 @@
  */
 import ZeroEntropy from 'zeroentropy';
 
-import { type LocalRerankOptions, localEngineScores } from './local-engine';
+import { type LocalRerankOptions, localEngineScores, scoreCrossEncoder } from './local-engine';
+import { isDeadlineFailure } from './scorer-gate';
 import type { RerankScoreFn } from './sidecar-reranker';
+
+export {
+  RERANK_MAX_CONCURRENT_ENV,
+  RerankDeadlineError,
+  getScorerGateState,
+  isDeadlineFailure,
+  runInScorerGate,
+} from './scorer-gate';
 
 export {
   DEFAULT_BATCH_SIZE,
@@ -257,9 +266,22 @@ async function localScores<T>(
   query: string,
   docs: Array<RerankDoc<T>>,
   opts: RerankOptions,
-): Promise<EngineScores> {
+): Promise<EngineScores | typeof SCORE_TIMEOUT> {
   const texts = docs.map((d) => d.text);
-  if (!opts.scorer) return await localEngineScores(query, texts, opts);
+  if (!opts.scorer) {
+    // Deliberately NOT `localEngineScores`, which collapses every failure into
+    // the same `null`. A deadline failure — including an admission SHED, where
+    // the shared scorer refused the job at ~0ms because it provably could not
+    // finish in time — must reach the caller as `timeout`, not `scoring-failed`:
+    // those two call for opposite responses, which is the whole reason
+    // `onDegrade` names them separately (WI-37670). The fail-safe itself is
+    // unchanged; only the reason is now preserved.
+    try {
+      return await scoreCrossEncoder(query, texts, opts);
+    } catch (err) {
+      return isDeadlineFailure(err) ? SCORE_TIMEOUT : null;
+    }
+  }
   try {
     // Forward the deadline: the production wiring ALWAYS takes this branch (the
     // operator injects a sidecar-first scorer), and with no sidecar that scorer
@@ -276,8 +298,11 @@ async function localScores<T>(
     // it as a failure rather than ranking on garbage.
     if (!Array.isArray(scores) || scores.length !== texts.length) return null;
     return scores.map((s) => (typeof s === 'number' && Number.isFinite(s) ? s : undefined));
-  } catch {
-    return null;
+  } catch (err) {
+    // Same distinction as the branch above: an injected scorer (the sidecar
+    // client, whose own fallback is the in-process engine) can surface a
+    // deadline failure, and that is a budget verdict rather than an outage.
+    return isDeadlineFailure(err) ? SCORE_TIMEOUT : null;
   }
 }
 
@@ -306,10 +331,10 @@ const SCORE_TIMEOUT = Symbol('rerank-score-timeout');
  * because "too slow for your budget" and "the engine cannot score" call for
  * opposite responses from the caller.
  */
-async function withScoreTimeout(
-  scores: Promise<EngineScores>,
+async function withScoreTimeout<S>(
+  scores: Promise<S>,
   timeoutMs: number,
-): Promise<EngineScores | typeof SCORE_TIMEOUT> {
+): Promise<S | typeof SCORE_TIMEOUT> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return scores;
 
   // The race loser keeps running (inference/fetch are not cancellable here). If
