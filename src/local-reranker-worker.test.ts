@@ -102,16 +102,24 @@ describe('local rerank worker (real thread)', () => {
     // reply land — this observes the in-flight state deterministically rather
     // than guessing at a number of ticks.
     for (let i = 0; i < 50 && getRerankWorkerState().pendingCount === 0; i++) await Promise.resolve();
-    expect(getRerankWorkerState().pendingCount).toBe(1);
 
     // IN FLIGHT ⇒ ref'd. Without this the loop looks idle while the caller
     // awaits, `beforeExit` fires, and the hook terminates this very request
     // (WI-37680) — which reads to the caller as "no worker available".
-    expect(getRerankWorkerState().keepAlive).toBe(true);
+    //
+    // ⚠ ONE atomic snapshot, asserted as an invariant — deliberately NOT two
+    // separate `expect(getRerankWorkerState()...)` reads. Reading `pendingCount`
+    // and `keepAlive` in separate assertions let the reply land BETWEEN them, so
+    // this red under fleet load while the property itself was fine
+    // (EI-20053788422725852). The property is real; the measurement was fragile.
+    const snap = getRerankWorkerState();
+    expect({ pending: snap.pendingCount > 0, keepAlive: snap.keepAlive })
+      .toEqual({ pending: true, keepAlive: true });
 
     await inflight;
-    expect(getRerankWorkerState().pendingCount).toBe(0);
-    expect(getRerankWorkerState().keepAlive).toBe(false);
+    const after = getRerankWorkerState();
+    expect({ pending: after.pendingCount > 0, keepAlive: after.keepAlive })
+      .toEqual({ pending: false, keepAlive: false });
   }, 30_000);
 
   it('does not tear the worker down from beforeExit while a request is pending', async () => {
