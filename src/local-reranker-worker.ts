@@ -227,6 +227,7 @@ export async function shutdownLocalReranker(): Promise<void> {
   _worker = null;
   _workerReady = null;
   _workerDisabled = false;
+  _refd = false;
   _pending.clear();
   _nextId = 0;
 }
@@ -240,7 +241,16 @@ function installBeforeExitHook(): void {
   // `beforeExit` (unlike `exit`) permits async work, which is required because
   // `terminate()` returns a Promise. It fires only once the loop would go idle,
   // which is exactly why the worker unrefs itself above.
-  _beforeExitListener = () => shutdownLocalReranker();
+  //
+  // The pending guard is belt-and-braces: `syncWorkerRef` should make an idle
+  // loop impossible while a request is in flight, so this branch is unreachable
+  // by design. It stays because the failure it prevents (terminating a worker
+  // mid-request, which the caller then reads as "no worker available") is
+  // silent, and because a future ref bug would otherwise re-open it.
+  _beforeExitListener = async () => {
+    if (_pending.size > 0) return;
+    await shutdownLocalReranker();
+  };
   process.on('beforeExit', _beforeExitListener);
 }
 
@@ -256,8 +266,20 @@ export function getRerankWorkerState(): {
   alive: boolean;
   disabled: boolean;
   pendingCount: number;
+  /**
+   * True while the worker is holding the event loop open — i.e. a request is in
+   * flight. Must track `pendingCount > 0` exactly: a `false` here with pending
+   * work is the WI-37680 defect (`beforeExit` fires mid-request and terminates
+   * the worker), and a `true` with none keeps a one-off script alive forever.
+   */
+  keepAlive: boolean;
 } {
-  return { alive: _worker !== null, disabled: _workerDisabled, pendingCount: _pending.size };
+  return {
+    alive: _worker !== null,
+    disabled: _workerDisabled,
+    pendingCount: _pending.size,
+    keepAlive: _refd,
+  };
 }
 
 /**

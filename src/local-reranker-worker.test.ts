@@ -13,6 +13,12 @@
  * thread — is unobservable if the thread boundary is faked away.
  */
 
+import { execFile } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { promisify } from 'node:util';
+
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   _resetBeforeExitHookForTest,
@@ -82,6 +88,84 @@ describe('local rerank worker (real thread)', () => {
     // here: the caller's Promise.race would be the ONLY thing bounding it.
     expect(getRerankWorkerState().pendingCount).toBe(0);
   }, 30_000);
+
+  it('holds the event loop open for exactly as long as a request is in flight', async () => {
+    await scoreViaWorker({ ...baseReq }); // warm: the worker is ready and idle
+
+    // IDLE ⇒ unref'd. This half is a real control, not decoration: "always ref"
+    // would pass the in-flight assertion below while re-breaking the property
+    // the unref exists for (a one-off script that can never exit).
+    expect(getRerankWorkerState().keepAlive).toBe(false);
+
+    const inflight = scoreViaWorker({ ...baseReq });
+    // The worker answers on a MACROTASK, so draining microtasks cannot let the
+    // reply land — this observes the in-flight state deterministically rather
+    // than guessing at a number of ticks.
+    for (let i = 0; i < 50 && getRerankWorkerState().pendingCount === 0; i++) await Promise.resolve();
+    expect(getRerankWorkerState().pendingCount).toBe(1);
+
+    // IN FLIGHT ⇒ ref'd. Without this the loop looks idle while the caller
+    // awaits, `beforeExit` fires, and the hook terminates this very request
+    // (WI-37680) — which reads to the caller as "no worker available".
+    expect(getRerankWorkerState().keepAlive).toBe(true);
+
+    await inflight;
+    expect(getRerankWorkerState().pendingCount).toBe(0);
+    expect(getRerankWorkerState().keepAlive).toBe(false);
+  }, 30_000);
+
+  it('does not tear the worker down from beforeExit while a request is pending', async () => {
+    await scoreViaWorker({ ...baseReq });
+
+    const inflight = scoreViaWorker({ ...baseReq });
+    for (let i = 0; i < 50 && getRerankWorkerState().pendingCount === 0; i++) await Promise.resolve();
+    expect(getRerankWorkerState().pendingCount).toBe(1);
+
+    // Fire the hook by hand. `syncWorkerRef` should make this unreachable in a
+    // real process; the guard behind it is what keeps a future ref regression
+    // from silently re-opening the same hole.
+    await Promise.all(process.listeners('beforeExit').map((fn) => (fn as () => unknown)()));
+
+    await expect(inflight).resolves.toEqual([]);
+    expect(getRerankWorkerState().alive).toBe(true);
+  }, 30_000);
+
+  it('answers a host whose event loop is otherwise idle (child process)', async () => {
+    // THE reproduction. The defect only exists when nothing else holds the loop
+    // open, which is unreproducible inside vitest — its own runner always has
+    // work pending. So this spawns a bare host that awaits one rerank and does
+    // nothing else, which is every CLI, bench and one-off script.
+    //
+    // Zero pairs on purpose: the worker replies without loading a model, so this
+    // needs no download and still crosses the full thread boundary. Pre-fix it
+    // failed 100% of the time with `rerank worker exited with code 1`.
+    const dir = mkdtempSync(join(tmpdir(), 'rerank-idle-loop-'));
+    try {
+      const modulePath = resolve(__dirname, 'local-reranker-worker.ts');
+      const child = join(dir, 'idle-host.mts');
+      writeFileSync(
+        child,
+        `const { scoreViaWorker } = await import(${JSON.stringify(modulePath)});\n` +
+          `try {\n` +
+          `  const scores = await scoreViaWorker({ query: 'q', texts: [], model: 'm',\n` +
+          `    dtype: 'q8', device: 'cpu', maxLength: 512, batchSize: 16 });\n` +
+          `  console.log('CHILD_OK ' + JSON.stringify(scores));\n` +
+          `} catch (err) {\n` +
+          `  console.log('CHILD_FAIL ' + (err instanceof Error ? err.message : String(err)));\n` +
+          `}\n`,
+      );
+
+      const { stdout } = await promisify(execFile)('npx', ['tsx', child], {
+        cwd: resolve(__dirname, '..'),
+        timeout: 90_000,
+      });
+
+      expect(stdout).toContain('CHILD_OK');
+      expect(stdout).not.toContain('CHILD_FAIL');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it('shutdown terminates the worker and allows a later respawn', async () => {
     await scoreViaWorker({ ...baseReq });
