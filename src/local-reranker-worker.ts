@@ -48,6 +48,44 @@ let _workerDisabled = false;
 let _beforeExitHookInstalled = false;
 let _beforeExitListener: (() => Promise<void>) | null = null;
 
+/**
+ * Whether the worker is currently holding the event loop open. Mirrors the last
+ * `ref()`/`unref()` we issued, because `Worker` exposes no way to read it back.
+ */
+let _refd = false;
+
+/**
+ * Hold the loop open for EXACTLY as long as a request is in flight, and not one
+ * moment longer.
+ *
+ * WHY BOTH HALVES ARE LOAD-BEARING (WI-37680). An always-ref'd worker keeps a
+ * one-shot script alive forever — the bug the original `unref()` fixed. But an
+ * always-UNREF'd worker is worse in a way that is silent: while the caller
+ * awaits a reply, the unref'd worker (and its port) no longer count as loop
+ * work, so a host with nothing else ref'd is considered IDLE **mid-request**.
+ * `beforeExit` then fires, the hook below terminates the worker, and the exit
+ * handler rejects the in-flight request with `rerank worker exited with code 1`
+ * — which `scoreCrossEncoder` reads as "the worker is unavailable" and answers
+ * by falling back to inline main-thread scoring.
+ *
+ * So the whole worker-thread mechanism silently did not apply on any host whose
+ * loop is otherwise empty: every CLI, bench and one-off script. Those are
+ * exactly the hosts where it was measured, which is how the inline path's
+ * serialization got recorded as a property of the worker path (WI-37676).
+ * Measured 2026-08-10: a `scoreViaWorker` with ZERO pairs — no model load at
+ * all — failed this way 100% of the time from a standalone script.
+ *
+ * Ref'ing only while `_pending` is non-empty satisfies both: a script that
+ * awaits a rerank stays alive until its answer arrives, then exits naturally.
+ */
+function syncWorkerRef(): void {
+  const want = _pending.size > 0;
+  if (!_worker || want === _refd) return;
+  if (want) _worker.ref();
+  else _worker.unref();
+  _refd = want;
+}
+
 function workerPath(): string {
   // Co-located with this module, resolved at RUNTIME so the path survives
   // build-time bundling — provided the build copies the script beside the
@@ -87,7 +125,12 @@ function ensureWorker(): Promise<void> {
           // such a script finish on its own; the beforeExit hook below then
           // terminates the worker cleanly. Same reasoning as the embedder's
           // EI-19464316359123796.
-          _worker?.unref();
+          //
+          // A freshly constructed Worker is ref'd, so record that and let
+          // `syncWorkerRef` decide: idle ⇒ unref (the behaviour above), a
+          // request already in flight ⇒ stay ref'd until it answers (WI-37680).
+          _refd = true;
+          syncWorkerRef();
           installBeforeExitHook();
           resolveReady();
           return;
@@ -96,6 +139,9 @@ function ensureWorker(): Promise<void> {
         const p = _pending.get(msg.id);
         if (!p) return;
         _pending.delete(msg.id);
+        // Release the loop as soon as the LAST request settles, so a one-off
+        // script exits on its own.
+        syncWorkerRef();
         if (msg.kind === 'score_ok' && Array.isArray(msg.scores)) p.resolve(msg.scores);
         else p.reject(new Error(msg.error ?? 'rerank worker error'));
       },
@@ -109,6 +155,7 @@ function ensureWorker(): Promise<void> {
       _pending.clear();
       _worker = null;
       _workerReady = null;
+      _refd = false;
       if (!initialized) rejectReady(err);
     });
 
@@ -122,6 +169,7 @@ function ensureWorker(): Promise<void> {
       _pending.clear();
       _worker = null;
       _workerReady = null;
+      _refd = false;
     });
   }).catch((err) => {
     _workerReady = null;
@@ -156,6 +204,10 @@ export async function scoreViaWorker(req: ScoreViaWorkerRequest): Promise<number
   const id = _nextId++;
   return new Promise<number[]>((resolveScore, rejectScore) => {
     _pending.set(id, { resolve: resolveScore, reject: rejectScore });
+    // Ref BEFORE posting: between the post and the reply the caller is awaiting
+    // a Promise, which is not loop work — an unref'd worker would leave the loop
+    // looking idle and let `beforeExit` terminate this very request.
+    syncWorkerRef();
     _worker!.postMessage({ kind: 'score', id, ...req });
   });
 }
