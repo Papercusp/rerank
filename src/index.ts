@@ -153,7 +153,36 @@ export interface RerankOptions extends LocalRerankOptions {
    * surfacing as an unhandled rejection after we have already degraded.
    */
   timeoutMs?: number;
+  /**
+   * Called EXACTLY ONCE, and only when this call fell through to the fail-safe
+   * passthrough — i.e. the returned rows are the INPUT order with
+   * `reranked: false`. Never called on a successful rerank.
+   *
+   * WHY IT EXISTS (WI-37670). The passthrough is the whole point of this
+   * library's fail-safe contract, but it is byte-identical to what a
+   * rerank-DISABLED caller produces, so from the outside a degraded stage and a
+   * healthy stage that simply found nothing to reorder look the same. A caller
+   * measuring the reranker's effect (an A/B, a bench, a scorecard) then reads a
+   * confident +0.000 and concludes "reranking does not help" — which happened,
+   * and had to be retracted. Reporting WHY the passthrough fired is what lets a
+   * caller void the reading instead of publishing it.
+   */
+  onDegrade?: (reason: RerankDegradeReason) => void;
 }
+
+/**
+ * Why a rerank call fell through to the fail-safe passthrough.
+ *
+ * These mean OPPOSITE things operationally and must not be collapsed:
+ * `empty-input` is benign; `timeout` says the stage was too slow for the
+ * caller's budget (raise the budget, cut the candidate count, or reduce
+ * in-flight concurrency — one serialized inference thread multiplies every
+ * concurrent call's wall clock); `scoring-failed` says the engine could not
+ * score at all (missing credential, unavailable runtime, a scorer that threw,
+ * or a length mismatch); `no-usable-scores` says it scored but nothing survived
+ * shaping (`minScore`/`topN`).
+ */
+export type RerankDegradeReason = 'empty-input' | 'timeout' | 'scoring-failed' | 'no-usable-scores';
 
 export interface RerankResult<T> {
   /** Caller's payload, carried through untouched. */
@@ -271,11 +300,16 @@ export const DEFAULT_RERANK_TIMEOUT_MS = 20_000;
 const SCORE_TIMEOUT = Symbol('rerank-score-timeout');
 
 /**
- * Resolve `scores`, or `null` if `timeoutMs` elapses first — `null` is exactly
- * what the engines already return when they cannot score, so a timeout reuses
- * the single fail-safe passthrough instead of adding a second degradation path.
+ * Resolve `scores`, or the {@link SCORE_TIMEOUT} sentinel if `timeoutMs` elapses
+ * first. Both still take the SINGLE fail-safe passthrough in {@link rerank} —
+ * the sentinel exists only so the passthrough can NAME which of the two fired,
+ * because "too slow for your budget" and "the engine cannot score" call for
+ * opposite responses from the caller.
  */
-async function withScoreTimeout(scores: Promise<EngineScores>, timeoutMs: number): Promise<EngineScores> {
+async function withScoreTimeout(
+  scores: Promise<EngineScores>,
+  timeoutMs: number,
+): Promise<EngineScores | typeof SCORE_TIMEOUT> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return scores;
 
   // The race loser keeps running (inference/fetch are not cancellable here). If
@@ -291,7 +325,7 @@ async function withScoreTimeout(scores: Promise<EngineScores>, timeoutMs: number
         timer = setTimeout(() => resolve(SCORE_TIMEOUT), timeoutMs);
       }),
     ]);
-    return winner === SCORE_TIMEOUT ? null : winner;
+    return winner;
   } finally {
     // Always clear: a surviving timer would hold the event loop open for up to
     // timeoutMs after a fast rerank already returned.
@@ -304,10 +338,14 @@ export async function rerank<T>(
   docs: Array<RerankDoc<T>>,
   opts: RerankOptions = {},
 ): Promise<Array<RerankResult<T>>> {
-  const passthrough = (): Array<RerankResult<T>> =>
-    docs.slice(0, opts.topN ?? docs.length).map((d) => ({ row: d.row, score: 0, reranked: false }));
+  // Every fail-safe passthrough NAMES its reason: a caller measuring the
+  // reranker's effect cannot otherwise tell a degrade from a null result.
+  const passthrough = (reason: RerankDegradeReason): Array<RerankResult<T>> => {
+    opts.onDegrade?.(reason);
+    return docs.slice(0, opts.topN ?? docs.length).map((d) => ({ row: d.row, score: 0, reranked: false }));
+  };
 
-  if (!query.trim() || docs.length === 0) return passthrough();
+  if (!query.trim() || docs.length === 0) return passthrough('empty-input');
 
   const timeoutMs = opts.timeoutMs ?? DEFAULT_RERANK_TIMEOUT_MS;
 
@@ -327,7 +365,8 @@ export async function rerank<T>(
       : zeroEntropyScores(query, docs, scoringOpts),
     timeoutMs,
   );
-  if (!scores) return passthrough();
+  if (scores === SCORE_TIMEOUT) return passthrough('timeout');
+  if (!scores) return passthrough('scoring-failed');
 
   let ordered = docs
     .map((d, i) => ({ row: d.row, score: scores[i], reranked: true }))
@@ -340,5 +379,5 @@ export async function rerank<T>(
   if (typeof opts.minScore === 'number') ordered = ordered.filter((r) => r.score >= opts.minScore!);
   if (typeof opts.topN === 'number') ordered = ordered.slice(0, opts.topN);
   // Guard: if shaping left nothing usable, fall back rather than drop results.
-  return ordered.length > 0 ? ordered : passthrough();
+  return ordered.length > 0 ? ordered : passthrough('no-usable-scores');
 }

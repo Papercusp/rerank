@@ -284,6 +284,78 @@ describe('passthrough triggers (fail-safe contract)', () => {
   });
 });
 
+/**
+ * WI-37670. The passthrough is byte-identical to a rerank-DISABLED result, so a
+ * caller measuring the reranker's effect cannot tell a degrade from a null
+ * finding. `onDegrade` is the only signal that distinguishes them — and the
+ * reasons must stay distinct, because "too slow for your budget" and "the engine
+ * cannot score" call for opposite responses.
+ */
+describe('onDegrade — every passthrough names itself', () => {
+  let seen: string[] = [];
+  const onDegrade = (r: string) => void seen.push(r);
+  beforeEach(() => {
+    seen = [];
+  });
+
+  it('a scorer slower than timeoutMs reports `timeout`', async () => {
+    await rerank('query', docs, {
+      engine: 'local',
+      scorer: async () => {
+        await new Promise((r) => setTimeout(r, 2_000));
+        return [0.1, 0.9, 0.5];
+      },
+      timeoutMs: 25,
+      onDegrade,
+    });
+    expect(seen).toEqual(['timeout']);
+  });
+
+  it('a scorer that throws reports `scoring-failed`, NOT `timeout`', async () => {
+    await rerank('query', docs, {
+      engine: 'local',
+      scorer: async () => {
+        throw new Error('engine down');
+      },
+      timeoutMs: 5_000,
+      onDegrade,
+    });
+    expect(seen).toEqual(['scoring-failed']);
+  });
+
+  it('a blank query reports `empty-input`', async () => {
+    await rerank('   ', docs, { apiKey: freshKey(), onDegrade });
+    expect(seen).toEqual(['empty-input']);
+  });
+
+  it('minScore filtering everything out reports `no-usable-scores`', async () => {
+    await rerank('query', docs, {
+      engine: 'local',
+      scorer: async () => [0.1, 0.2, 0.3],
+      minScore: 0.9,
+      onDegrade,
+    });
+    expect(seen).toEqual(['no-usable-scores']);
+  });
+
+  /**
+   * THE CONTROL. Without this the four assertions above all pass against an
+   * implementation that simply fires `onDegrade` unconditionally — which would
+   * make a healthy rerank report as a degrade, i.e. the same bug with the sign
+   * flipped (a bench voiding every valid run instead of publishing every void
+   * one).
+   */
+  it('a SUCCESSFUL rerank never fires onDegrade', async () => {
+    const out = await rerank('query', docs, {
+      engine: 'local',
+      scorer: async () => [0.1, 0.9, 0.5],
+      onDegrade,
+    });
+    expect(out.every((r) => r.reranked)).toBe(true);
+    expect(seen).toEqual([]);
+  });
+});
+
 describe('scoring timeout (bounded degradation)', () => {
   /** A scorer that takes `ms` before returning index-aligned scores for `docs`. */
   const slowScorer =
