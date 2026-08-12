@@ -224,7 +224,7 @@ function createSidecarAdmissionGate(now: () => number): {
   };
 
   return {
-    enqueue<T>(pairs, deadline, run) {
+    enqueue<T>(pairs: number, deadline: number, run: () => Promise<T>): Promise<T> {
       return new Promise<T>((resolve, reject) => {
         waiting.push({
           pairs,
