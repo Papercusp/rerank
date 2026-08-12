@@ -140,7 +140,7 @@ describe('buildSidecarFirstReranker — sidecar REQUIRED', () => {
       fetchFn: fetchFn as unknown as typeof fetch,
       now: t.now,
       sleepFn: t.sleepFn,
-      onTransition: (state) => transitions.push(state),
+      onTransition: (state: 'down' | 'up' | 'rejected') => transitions.push(state),
     });
     expect(await score('q', ['a'])).toEqual([0.5]);
     expect(calls).toBe(3);
@@ -176,7 +176,7 @@ describe('buildSidecarFirstReranker — sidecar REQUIRED', () => {
       fetchFn: fetchFn as unknown as typeof fetch,
       now: t.now,
       sleepFn: t.sleepFn,
-      onTransition: (state) => transitions.push(state),
+      onTransition: (state: 'down' | 'up' | 'rejected') => transitions.push(state),
     });
     await expect(score('q', ['a'])).rejects.toThrow(/sidecar_rejected_request/);
     expect(fetchFn).toHaveBeenCalledTimes(1);
@@ -210,17 +210,19 @@ describe('buildSidecarFirstReranker — sidecar REQUIRED', () => {
       return okResponse(body.texts.map((text) => text.length));
     });
     const transitions: string[] = [];
-    const score = buildSidecarFirstReranker({
+    const buildOpts = {
       url: 'http://x',
       timeoutMs: 5_000,
       maxAttempts: 1,
       now: () => clock,
       fetchFn: fetchFn as unknown as typeof fetch,
-      onTransition: (state) => transitions.push(state),
-    });
+      onTransition: (state: 'down' | 'up' | 'rejected') => transitions.push(state),
+    };
+    const score = buildSidecarFirstReranker(buildOpts);
+    const separateClient = buildSidecarFirstReranker(buildOpts);
 
     const first = score('q1', ['a'], { deadline: 5_000 });
-    const queued = score('q2', ['b'], { deadline: 450 });
+    const queued = separateClient('q2', ['b'], { deadline: 450 });
 
     await expect(first).resolves.toEqual([1]);
     await expect(queued).rejects.toThrow(/deadline exceeded/);

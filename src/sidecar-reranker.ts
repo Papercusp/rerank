@@ -160,6 +160,10 @@ interface SidecarAdmissionEntry {
   reject: (reason?: unknown) => void;
 }
 
+interface SidecarAdmissionGate {
+  enqueue<T>(pairs: number, deadline: number, run: () => Promise<T>): Promise<T>;
+}
+
 /**
  * The sidecar's default scorer is one serialized inference resource. A
  * per-scorer HTTP queue keeps concurrent callers from piling whole batches
@@ -168,9 +172,7 @@ interface SidecarAdmissionEntry {
  * opens a socket. This is deliberately a separate gate from scorer-gate.ts:
  * the latter protects local CPU, while this one protects the remote sidecar.
  */
-function createSidecarAdmissionGate(now: () => number): {
-  enqueue<T>(pairs: number, deadline: number, run: () => Promise<T>): Promise<T>;
-} {
+function createSidecarAdmissionGate(now: () => number): SidecarAdmissionGate {
   let active = false;
   const waiting: SidecarAdmissionEntry[] = [];
   let msPerPair: number | null = null;
@@ -239,6 +241,42 @@ function createSidecarAdmissionGate(now: () => number): {
   };
 }
 
+/**
+ * Every operator-side scorer normally shares one builder, but keep the gate
+ * shared even when a bench or a test creates several clients. The weak keys
+ * avoid retaining custom fetch/clock seams after their caller is gone, while
+ * the production `fetch`/`Date.now` pair gives all clients for one sidecar a
+ * single admission lane.
+ */
+const sidecarAdmissionGates = new Map<string, WeakMap<object, WeakMap<object, SidecarAdmissionGate>>>();
+
+function sidecarAdmissionGateFor(
+  url: string,
+  model: string,
+  fetchFn: typeof fetch,
+  now: () => number,
+): SidecarAdmissionGate {
+  const key = `${url}\0${model}`;
+  let byFetch = sidecarAdmissionGates.get(key);
+  if (!byFetch) {
+    byFetch = new WeakMap<object, WeakMap<object, SidecarAdmissionGate>>();
+    sidecarAdmissionGates.set(key, byFetch);
+  }
+  const fetchKey = fetchFn as unknown as object;
+  let byClock = byFetch.get(fetchKey);
+  if (!byClock) {
+    byClock = new WeakMap<object, SidecarAdmissionGate>();
+    byFetch.set(fetchKey, byClock);
+  }
+  const clockKey = now as unknown as object;
+  let gate = byClock.get(clockKey);
+  if (!gate) {
+    gate = createSidecarAdmissionGate(now);
+    byClock.set(clockKey, gate);
+  }
+  return gate;
+}
+
 export interface SidecarFirstRerankerOpts {
   /** Sidecar-side model name ('rerank' | 'rerank-fast'). */
   model?: string;
@@ -281,7 +319,6 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
   const sleep = opts.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SIDECAR_TIMEOUT_MS;
   const maxAttempts = Math.max(1, opts.maxAttempts ?? DEFAULT_SIDECAR_MAX_ATTEMPTS);
-  const admission = createSidecarAdmissionGate(now);
   const onTransition =
     opts.onTransition ??
     ((state: 'down' | 'up' | 'rejected', detail: string) =>
@@ -313,6 +350,8 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
     return local;
   }
 
+  const fetchFn = opts.fetchFn ?? fetch;
+  const admission = sidecarAdmissionGateFor(url, model, fetchFn, now);
   let wasDown = false;
 
   return async (query: string, texts: string[], callOpts?: RerankScoreCallOpts): Promise<number[]> => {
@@ -331,7 +370,7 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
             query,
             texts,
             timeoutMs: remaining,
-            fetchFn: opts.fetchFn,
+            fetchFn,
           });
           if (wasDown) {
             wasDown = false;
