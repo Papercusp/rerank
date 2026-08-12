@@ -34,6 +34,7 @@
  */
 
 import { LOCAL_RERANKER_MODEL, scoreCrossEncoder } from './local-engine';
+import { RerankDeadlineError, isDeadlineFailure } from './scorer-gate';
 
 /**
  * Per-call scoring controls. Optional so that every existing
@@ -43,12 +44,11 @@ export interface RerankScoreCallOpts {
   /**
    * Absolute epoch-ms instant after which scoring should STOP.
    *
-   * Honoured by the in-process engine, which is the one that needs it: it holds
-   * the thread, so an abandoned call keeps burning a core until it finishes.
-   * The sidecar path ignores it deliberately — that call is genuinely async and
-   * already bounded by its own retry budget, and re-bounding it here would
-   * truncate that retry policy (EI-20005411672741677 is about the in-process
-   * path only; the sidecar path was never broken and must not regress).
+   * Honoured by both engines. The in-process engine uses it to stop scoring
+   * after the caller has degraded; the sidecar path uses it for admission and
+   * for the HTTP attempt budget. Without this, concurrent callers can queue
+   * behind the sidecar's serialized scorer and then all abort together, while
+   * the client incorrectly reports a healthy-but-busy sidecar as down.
    */
   deadline?: number;
 }
@@ -152,6 +152,93 @@ export async function sidecarRerankBatch(url: string, opts: SidecarRerankBatchOp
   }
 }
 
+interface SidecarAdmissionEntry {
+  pairs: number;
+  deadline: number;
+  run: () => Promise<unknown>;
+  resolve: (value: unknown) => void;
+  reject: (reason?: unknown) => void;
+}
+
+/**
+ * The sidecar's default scorer is one serialized inference resource. A
+ * per-scorer HTTP queue keeps concurrent callers from piling whole batches
+ * into the server FIFO, and the measured cost of the last successful batch
+ * lets the queue shed a call that cannot fit its remaining deadline before it
+ * opens a socket. This is deliberately a separate gate from scorer-gate.ts:
+ * the latter protects local CPU, while this one protects the remote sidecar.
+ */
+function createSidecarAdmissionGate(now: () => number): {
+  enqueue<T>(pairs: number, deadline: number, run: () => Promise<T>): Promise<T>;
+} {
+  let active = false;
+  const waiting: SidecarAdmissionEntry[] = [];
+  let msPerPair: number | null = null;
+
+  const deadlineError = (entry: SidecarAdmissionEntry, remaining: number, predictedMs: number | null): Error =>
+    new RerankDeadlineError(
+      `rerank: scoring deadline exceeded before sidecar dispatch for ${entry.pairs} pairs — ` +
+        `the sidecar queue needs ~${predictedMs ?? 'unknown'}ms but only ${Math.max(0, Math.round(remaining))}ms remain; ` +
+        'shedding now rather than labeling a healthy sidecar as down',
+    );
+
+  const pump = (): void => {
+    if (active) return;
+    const entry = waiting.shift();
+    if (!entry) return;
+
+    const remaining = entry.deadline - now();
+    const predictedMs = msPerPair === null ? null : Math.ceil(msPerPair * entry.pairs);
+    if (remaining <= 0 || (predictedMs !== null && predictedMs > remaining)) {
+      entry.reject(deadlineError(entry, remaining, predictedMs));
+      // A queue can contain several calls whose deadlines have already
+      // expired. Drain those synchronously instead of leaving them to be
+      // mistaken for sidecar failures on a later wake.
+      pump();
+      return;
+    }
+
+    active = true;
+    const startedAt = now();
+    let completed = false;
+    void Promise.resolve()
+      .then(() => entry.run())
+      .then(
+        (value) => {
+          completed = true;
+          entry.resolve(value);
+        },
+        (err) => entry.reject(err),
+      )
+      .finally(() => {
+        if (completed) {
+          const elapsed = Math.max(0, now() - startedAt);
+          if (elapsed > 0 && entry.pairs > 0) {
+            const sample = elapsed / entry.pairs;
+            msPerPair = msPerPair === null ? sample : msPerPair * 0.3 + sample * 0.7;
+          }
+        }
+        active = false;
+        pump();
+      });
+  };
+
+  return {
+    enqueue<T>(pairs, deadline, run) {
+      return new Promise<T>((resolve, reject) => {
+        waiting.push({
+          pairs,
+          deadline,
+          run,
+          resolve: (value) => resolve(value as T),
+          reject,
+        });
+        pump();
+      });
+    },
+  };
+}
+
 export interface SidecarFirstRerankerOpts {
   /** Sidecar-side model name ('rerank' | 'rerank-fast'). */
   model?: string;
@@ -162,7 +249,8 @@ export interface SidecarFirstRerankerOpts {
   /** Sidecar base URL; defaults to resolveRerankSidecarUrl(). null/absent ⇒
    *  pure in-process. */
   url?: string | null;
-  /** TOTAL budget per call across every attempt (default 15s). */
+  /** TOTAL sidecar budget per call across every attempt (default 15s), unless
+   * the caller supplies a tighter absolute deadline. */
   timeoutMs?: number;
   /** Attempts within the budget on sidecar failure (default 3). */
   maxAttempts?: number;
@@ -193,6 +281,7 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
   const sleep = opts.sleepFn ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SIDECAR_TIMEOUT_MS;
   const maxAttempts = Math.max(1, opts.maxAttempts ?? DEFAULT_SIDECAR_MAX_ATTEMPTS);
+  const admission = createSidecarAdmissionGate(now);
   const onTransition =
     opts.onTransition ??
     ((state: 'down' | 'up' | 'rejected', detail: string) =>
@@ -226,60 +315,66 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
 
   let wasDown = false;
 
-  return async (query: string, texts: string[]): Promise<number[]> => {
+  return async (query: string, texts: string[], callOpts?: RerankScoreCallOpts): Promise<number[]> => {
     if (texts.length === 0) return [];
-    const deadline = now() + timeoutMs;
-    let lastErr: unknown;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const remaining = deadline - now();
-      if (remaining <= 0) break;
-      try {
-        const res = await sidecarRerankBatch(url, {
-          model,
-          query,
-          texts,
-          timeoutMs: remaining,
-          fetchFn: opts.fetchFn,
-        });
-        if (wasDown) {
-          wasDown = false;
-          onTransition('up', `sidecar answering again (attempt ${attempt})`);
+    const ownDeadline = now() + timeoutMs;
+    const deadline = callOpts?.deadline === undefined ? ownDeadline : Math.min(callOpts.deadline, ownDeadline);
+
+    return await admission.enqueue(texts.length, deadline, async () => {
+      let lastErr: unknown;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const remaining = deadline - now();
+        if (remaining <= 0) break;
+        try {
+          const res = await sidecarRerankBatch(url, {
+            model,
+            query,
+            texts,
+            timeoutMs: remaining,
+            fetchFn: opts.fetchFn,
+          });
+          if (wasDown) {
+            wasDown = false;
+            onTransition('up', `sidecar answering again (attempt ${attempt})`);
+          }
+          return res.scores;
+        } catch (e) {
+          lastErr = e;
+          if (isDeadlineFailure(e)) break;
+          if (isNonRetryableSidecarError(e)) {
+            // Deterministic 4xx: the sidecar is UP and correctly rejecting THIS
+            // request. Retrying the same payload can never succeed, so stop
+            // instead of burning the budget. Logged 'rejected', never 'down'.
+            onTransition(
+              'rejected',
+              `${e instanceof Error ? e.message : String(e)} — sidecar correctly rejected the request (non-retryable, not a downtime issue)`,
+            );
+            break;
+          }
+          if (!wasDown) {
+            wasDown = true;
+            onTransition(
+              'down',
+              `${e instanceof Error ? e.message : String(e)} — sidecar is REQUIRED (no in-process fallback); retrying within budget`,
+            );
+          }
+          const backoffMs = 250 * attempt;
+          if (attempt < maxAttempts && deadline - now() > backoffMs + 250) await sleep(backoffMs);
+          else break;
         }
-        return res.scores;
-      } catch (e) {
-        lastErr = e;
-        if (isNonRetryableSidecarError(e)) {
-          // Deterministic 4xx: the sidecar is UP and correctly rejecting THIS
-          // request. Retrying the same payload can never succeed, so stop
-          // instead of burning the budget. Logged 'rejected', never 'down'.
-          onTransition(
-            'rejected',
-            `${e instanceof Error ? e.message : String(e)} — sidecar correctly rejected the request (non-retryable, not a downtime issue)`,
-          );
-          break;
-        }
-        if (!wasDown) {
-          wasDown = true;
-          onTransition(
-            'down',
-            `${e instanceof Error ? e.message : String(e)} — sidecar is REQUIRED (no in-process fallback); retrying within budget`,
-          );
-        }
-        const backoffMs = 250 * attempt;
-        if (attempt < maxAttempts && deadline - now() > backoffMs + 250) await sleep(backoffMs);
-        else break;
       }
-    }
-    throw isNonRetryableSidecarError(lastErr)
-      ? new Error(
-          `sidecar_rejected_request: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
-            `(${url}, ${model}) — the sidecar rejected this request (non-retryable); ` +
-            'check payload shape/size — this is not a downtime issue',
-        )
-      : new Error(
-          `sidecar_required_unavailable: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
-            `(${url}, ${model}, budget ${timeoutMs}ms) — reranking requires the sidecar; ` +
-            'search degrades to retrieval order while it is down',
-        );
+      if (isDeadlineFailure(lastErr)) throw lastErr;
+      throw isNonRetryableSidecarError(lastErr)
+        ? new Error(
+            `sidecar_rejected_request: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
+              `(${url}, ${model}) — the sidecar rejected this request (non-retryable); ` +
+              'check payload shape/size — this is not a downtime issue',
+          )
+        : new Error(
+            `sidecar_required_unavailable: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
+              `(${url}, ${model}, budget ${timeoutMs}ms) — reranking requires the sidecar; ` +
+              'search degrades to retrieval order while it is down',
+          );
+    });
   };
 }

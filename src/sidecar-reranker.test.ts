@@ -202,6 +202,34 @@ describe('buildSidecarFirstReranker — sidecar REQUIRED', () => {
     expect(fetchFn.mock.calls.length).toBeLessThan(10);
   });
 
+  it('serializes concurrent batches and sheds an impossible queued call before HTTP dispatch', async () => {
+    let clock = 0;
+    const fetchFn = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(init?.body as string) as { texts: string[] };
+      clock += 400;
+      return okResponse(body.texts.map((text) => text.length));
+    });
+    const transitions: string[] = [];
+    const score = buildSidecarFirstReranker({
+      url: 'http://x',
+      timeoutMs: 5_000,
+      maxAttempts: 1,
+      now: () => clock,
+      fetchFn: fetchFn as unknown as typeof fetch,
+      onTransition: (state) => transitions.push(state),
+    });
+
+    const first = score('q1', ['a'], { deadline: 5_000 });
+    const queued = score('q2', ['b'], { deadline: 450 });
+
+    await expect(first).resolves.toEqual([1]);
+    await expect(queued).rejects.toThrow(/deadline exceeded/);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    // Queue admission, not sidecar health, caused the shed: do not flap the
+    // transition state or make the benchmark think the sidecar went down.
+    expect(transitions).toEqual([]);
+  });
+
   it('short-circuits an empty candidate list without a wire call', async () => {
     const fetchFn = vi.fn(async () => okResponse([]));
     const score = buildSidecarFirstReranker({ url: 'http://x', fetchFn: fetchFn as unknown as typeof fetch });
