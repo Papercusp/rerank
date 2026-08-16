@@ -1,0 +1,25 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+
+# WI-4419 (2026-07-12): agent state dirs (.papercusp/) appear inside submodules too,
+# and git-sync auto-commits the superproject AND every submodule — so any scratch a
+# gitignore does not cover is committed automatically and then swept into every
+# release bundle by the sidecar source-tar glob. The superproject .gitignore does NOT
+# reach inside a submodule, so the guard must be repeated here. Depth-matching (**/)
+# on purpose: a slash-bearing pattern is anchored to THIS file's directory.
+.papercusp/scratch/
+.papercusp/vitest-tmp/
+.papercusp/tmp/
+.papercusp/tmp-*/
+.papercusp/logs/
+.papercusp/bench-reports/
+.papercusp/pi-sessions/
+**/.papercusp/scratch/
+**/.papercusp/vitest-tmp/
+**/.papercusp/tmp/
+**/.papercusp/tmp-*/
+**/.papercusp/logs/
+**/.papercusp/bench-reports/
+**/.papercusp/pi-sessions/
