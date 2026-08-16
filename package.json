@@ -1,0 +1,36 @@
+{
+  "name": "@papercusp/rerank",
+  "version": "0.1.0",
+  "description": "Engine-agnostic cross-encoder reranking: a local ONNX cross-encoder (no key, no network) or the hosted ZeroEntropy zerank API. Shared across Papercusp and Restart.",
+  "license": "UNLICENSED",
+  "$comment_type": "MUST stay \"module\". This package is named-imported by ESM consumers (@papercusp/search-core, operator-core) running under tsx. As a TYPELESS package tsx transpiles it to CJS, and Node then links named imports via cjs-module-lexer — which cannot see `export … from` re-export chains, so the whole namespace links EMPTY and EVERY named import throws at runtime. Unit tests and tsc do NOT catch it (vitest/vite bundle instead of linking). Native ESM makes re-exports linkable.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "sideEffects": false,
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zeroentropy": "^0.1.0-alpha.10"
+  },
+  "peerDependencies": {
+    "@huggingface/transformers": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "@huggingface/transformers": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "restricted"
+  }
+}
