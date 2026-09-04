@@ -2,3 +2,39 @@ node_modules/
 dist/
 *.tsbuildinfo
 .vite/
+
+# WI-4419 (2026-07-12): agent state dirs (.papercusp/) appear inside submodules too,
+# and git-sync auto-commits the superproject AND every submodule — so any scratch a
+# gitignore does not cover is committed automatically and then swept into every
+# release bundle by the sidecar source-tar glob. The superproject .gitignore does NOT
+# reach inside a submodule, so the guard must be repeated here. Depth-matching (**/)
+# on purpose: a slash-bearing pattern is anchored to THIS file's directory.
+.papercusp/scratch/
+.papercusp/vitest-tmp/
+.papercusp/tmp/
+.papercusp/tmp-*/
+.papercusp/logs/
+.papercusp/bench-reports/
+.papercusp/pi-sessions/
+**/.papercusp/scratch/
+**/.papercusp/vitest-tmp/
+**/.papercusp/tmp/
+**/.papercusp/tmp-*/
+**/.papercusp/logs/
+**/.papercusp/bench-reports/
+**/.papercusp/pi-sessions/
+
+# Coverage reports — any Vitest/cargo-llvm-cov --coverage run.
+#
+# The SUPERPROJECT .gitignore already carries this exact rule set, but a
+# superproject ignore does NOT govern inside a submodule: `git check-ignore`
+# run from the repo root answers "is in submodule <p>" and declines, so the
+# rule silently stops at this boundary. Without a copy HERE, git-sync (which
+# commits the superproject AND every submodule) sweeps the generated report
+# into this repo. Same class as EI-22195215129102176 (74 files / +54,104
+# lines swept) and EI-22201289307647151 (this rule was missing from 22 of 38
+# coverage-capable submodules until then).
+coverage/
+coverage-*/
+**/coverage/
+**/coverage-*/
