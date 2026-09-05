@@ -43,9 +43,11 @@ export {
   activeExecutionTarget,
   loadCrossEncoder,
   localRerankAvailable,
+  rerankExecutionHealth,
   scoreCrossEncoder,
   scoreCrossEncoderInline,
   type LocalRerankOptions,
+  type RerankExecutionHealth,
 } from './local-engine';
 
 export {
@@ -60,6 +62,7 @@ export {
   CUDA_EXECUTION_TARGET,
   RERANK_DEVICE_ENV,
   WEBGPU_EXECUTION_TARGET,
+  demotedTarget,
   executionTargetFor,
   isCoherentTarget,
   resolveExecutionTarget,

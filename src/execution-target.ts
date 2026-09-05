@@ -75,6 +75,38 @@ export const WEBGPU_EXECUTION_TARGET: RerankExecutionTarget = Object.freeze({
 });
 
 /**
+ * The CPU pair, tagged as the outcome of a FAILED GPU attempt.
+ *
+ * ## Why this exists at all
+ *
+ * A demotion changes WHY we are on CPU, never WHICH kernels run — so `device`
+ * and `dtype` are exactly `CPU_EXECUTION_TARGET`'s and every consumer that
+ * branches on them is unaffected. Only `why` differs, and that difference is
+ * the entire point.
+ *
+ * Without it, a demoted host and a deliberate CPU host render BYTE-IDENTICALLY:
+ * both report `cpu`/`q8` with the "int8 kernels are native on x86" rationale,
+ * which reads as a healthy, considered choice. That collapse is not theoretical
+ * — it is why a GPU capability that was measured working (17x on this box) could
+ * silently revert and go unnoticed: the engine is fail-safe, so the only symptom
+ * is slowness, and the one health surface built to reveal the demotion
+ * (`rerankExecution` in the embed sidecar) had no value with which to say it.
+ *
+ * A degraded state that is indistinguishable from the healthy state is not
+ * observable, however many places report it.
+ */
+export function demotedTarget(from: RerankExecutionTarget, cause: string): RerankExecutionTarget {
+  return Object.freeze({
+    device: CPU_EXECUTION_TARGET.device,
+    dtype: CPU_EXECUTION_TARGET.dtype,
+    why:
+      `DEMOTED from ${from.device}/${from.dtype} — that session would not construct on this host, ` +
+      `so reranking is running on ${CPU_EXECUTION_TARGET.device}/${CPU_EXECUTION_TARGET.dtype} ` +
+      `(correct, but materially slower than the requested target). Cause: ${cause}`,
+  });
+}
+
+/**
  * Opt a GPU host in. Unset/`cpu` ⇒ the CPU pair; `cuda`/`webgpu` ⇒ the matching
  * GPU pair, still subject to the verified-load fallback in the engine.
  *

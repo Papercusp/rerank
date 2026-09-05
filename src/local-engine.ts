@@ -25,6 +25,7 @@ import {
   CPU_EXECUTION_TARGET,
   type RerankDevice,
   type RerankExecutionTarget,
+  demotedTarget,
   resolveExecutionTarget,
 } from './execution-target';
 import { getRerankWorkerState, scoreViaWorker, warnRerankFallback } from './local-reranker-worker';
@@ -221,13 +222,27 @@ function effectiveTarget(opts: LocalRerankOptions): RerankExecutionTarget {
  */
 let _gpuUnusable = false;
 
+/**
+ * The demotion itself, REMEMBERED rather than only logged.
+ *
+ * A `console.warn` fires once per process and is then gone: it cannot be read
+ * by a health check, a test, or an operator asking "why is search slow?" three
+ * weeks later. Keeping the verdict here is what lets `activeExecutionTarget()`
+ * and `rerankExecutionHealth()` distinguish a demoted host from a deliberate
+ * CPU one — see `demotedTarget` for why that distinction is load-bearing.
+ */
+let _demotion: { from: RerankExecutionTarget; cause: string; target: RerankExecutionTarget } | null =
+  null;
+
 /** Reported once per process when a GPU target is demoted, so the fallback is
  *  visible in a log instead of silently costing quality. */
 function reportDemotion(target: RerankExecutionTarget, err: unknown): void {
+  const cause = String((err as Error)?.message ?? err).slice(0, 200);
+  _demotion = { from: target, cause, target: demotedTarget(target, cause) };
   console.warn(
     `[rerank] ${target.device}/${target.dtype} session failed to construct — falling back to ` +
       `${CPU_EXECUTION_TARGET.device}/${CPU_EXECUTION_TARGET.dtype}. ` +
-      `Reranking continues on CPU. Cause: ${String((err as Error)?.message ?? err).slice(0, 200)}`,
+      `Reranking continues on CPU. Cause: ${cause}`,
   );
 }
 
@@ -265,7 +280,43 @@ function loadOnTarget(model: string, target: RerankExecutionTarget): Promise<Loa
  *  than the requested one. */
 export function activeExecutionTarget(): RerankExecutionTarget {
   const host = resolveExecutionTarget();
-  return host.device !== 'cpu' && _gpuUnusable ? CPU_EXECUTION_TARGET : host;
+  if (host.device === 'cpu' || !_gpuUnusable) return host;
+  // Report the DEMOTED pair, not the bare CPU constant: same device/dtype, but a
+  // `why` that says a GPU was asked for and refused. Falling back to the plain
+  // constant here is what made a degraded host unreadable from a healthy one.
+  return _demotion?.target ?? CPU_EXECUTION_TARGET;
+}
+
+/**
+ * Requested vs actual execution target, and whether the gap is a demotion.
+ *
+ * `activeExecutionTarget()` alone answers "what is running"; it cannot answer
+ * "is that what we asked for?" without the caller separately resolving the host
+ * target and comparing — which nothing in this repo did, so a GPU host that
+ * quietly reverted to CPU looked exactly like a CPU host. This returns both
+ * sides plus the verdict, so the comparison cannot be forgotten.
+ *
+ * `demoted: false` before the first load is HONEST, not a clean bill: the GPU
+ * session is only verified by constructing one. Read it after a load.
+ */
+export interface RerankExecutionHealth {
+  /** What this host asked for (`PAPERCUSP_RERANK_DEVICE`). */
+  requested: RerankExecutionTarget;
+  /** What it will actually run on, after any verified demotion. */
+  active: RerankExecutionTarget;
+  /** True once a requested GPU target has failed to construct a session. */
+  demoted: boolean;
+  /** The construction error that forced the demotion; null when not demoted. */
+  demotionCause: string | null;
+}
+
+export function rerankExecutionHealth(): RerankExecutionHealth {
+  return {
+    requested: resolveExecutionTarget(),
+    active: activeExecutionTarget(),
+    demoted: _demotion !== null,
+    demotionCause: _demotion?.cause ?? null,
+  };
 }
 
 const sigmoid = (x: number): number => 1 / (1 + Math.exp(-x));
@@ -487,6 +538,7 @@ export function _setLoaderForTest(
   _loaderOverride = loader;
   _models.clear();
   _gpuUnusable = false;
+  _demotion = null;
   // Reset the worker-dispatch escape too, so a test that enabled it cannot leak
   // the worker path into an unrelated later test via the shared afterEach.
   _workerWithLoaderForTest = false;
