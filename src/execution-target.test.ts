@@ -152,7 +152,17 @@ describe('verified GPU selection (engine)', () => {
 
     await loadCrossEncoder();
 
-    expect(activeExecutionTarget()).toEqual(CPU_EXECUTION_TARGET);
+    const active = activeExecutionTarget();
+    // The original intent, unchanged: it must NOT still be claiming the GPU.
+    expect(active).not.toEqual(CUDA_EXECUTION_TARGET);
+    expect(active.device).toBe(CPU_EXECUTION_TARGET.device);
+    expect(active.dtype).toBe(CPU_EXECUTION_TARGET.dtype);
+    // Strengthened: it must also not be indistinguishable from a host that
+    // deliberately chose CPU. This used to assert toEqual(CPU_EXECUTION_TARGET),
+    // which pinned that collapse as correct — and it is exactly what let a GPU
+    // capability revert unnoticed (see execution-demotion.test.ts).
+    expect(active.why).toContain('DEMOTED');
+    expect(active.why).toContain('libcudnn.so.9 missing');
   });
 
   it('still surfaces a CPU load failure instead of recursing forever', async () => {
