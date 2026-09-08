@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   _resetBeforeExitHookForTest,
   _resetRerankWorkerForTest,
@@ -43,6 +43,31 @@ afterEach(async () => {
 });
 
 describe('local rerank worker (real thread)', () => {
+  it('shares worker ownership and shutdown across distinct module records', async () => {
+    const { Worker } = await import('node:worker_threads');
+    const first = await import('./local-reranker-worker');
+    let second: typeof first | undefined;
+    const post = vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(() => {});
+    const pending = first.scoreViaWorker({ ...baseReq }).catch((error: unknown) => error);
+    try {
+      await vi.waitFor(() => expect(first.getRerankWorkerState().pendingCount).toBe(1));
+      vi.resetModules();
+      second = await import('./local-reranker-worker');
+      expect(second.scoreViaWorker).not.toBe(first.scoreViaWorker);
+      expect(second.getRerankWorkerState()).toEqual(first.getRerankWorkerState());
+      await second.shutdownLocalReranker();
+      expect(await pending).toBeInstanceOf(Error);
+      expect(first.getRerankWorkerState()).toMatchObject({ alive: false, pendingCount: 0 });
+    } finally {
+      post.mockRestore();
+      await first.shutdownLocalReranker();
+      await second?.shutdownLocalReranker();
+      await pending;
+      first._resetBeforeExitHookForTest();
+      second?._resetBeforeExitHookForTest();
+    }
+  });
+
   it('spawns, completes the ready handshake, and round-trips a request', async () => {
     expect(getRerankWorkerState().alive).toBe(false);
 

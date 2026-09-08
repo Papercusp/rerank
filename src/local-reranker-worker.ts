@@ -17,6 +17,7 @@
  * worker is unavailable — degraded, never broken.
  */
 
+import { pinModuleState } from '@papercusp/module-singleton';
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname } from 'node:path';
@@ -27,32 +28,43 @@ interface PendingRequest {
   reject: (err: Error) => void;
 }
 
-let _worker: Worker | null = null;
-let _workerReady: Promise<void> | null = null;
-let _nextId = 0;
-const _pending = new Map<number, PendingRequest>();
-/**
- * Set ONLY for genuine, permanent unavailability — the worker could not be
- * CONSTRUCTED at all (no `worker_threads`, missing script, spawn threw). A
- * runtime crash deliberately does NOT set this: it clears the worker handle so
- * the next call respawns one.
- *
- * That asymmetry is the point (the lesson EI-16184 taught the embedder path):
- * treating a transient crash as permanent condemns every later call in the
- * process to the inline, main-thread-blocking path — i.e. one hiccup silently
- * undoes this whole module for the rest of the process's life.
- */
-let _workerDisabled = false;
-/** Guards the process-level `beforeExit` hook so it is installed at most once,
- *  however many times a worker (re)spawns. */
-let _beforeExitHookInstalled = false;
-let _beforeExitListener: (() => Promise<void>) | null = null;
+interface WorkerState {
+  worker: Worker | null;
+  workerReady: Promise<void> | null;
+  nextId: number;
+  pending: Map<number, PendingRequest>;
+  /**
+   * Set ONLY for genuine, permanent unavailability — the worker could not be
+   * CONSTRUCTED at all (no `worker_threads`, missing script, spawn threw). A
+   * runtime crash deliberately does NOT set this: it clears the worker handle so
+   * the next call respawns one.
+   *
+   * That asymmetry is the point (the lesson EI-16184 taught the embedder path):
+   * treating a transient crash as permanent condemns every later call in the
+   * process to the inline, main-thread-blocking path — i.e. one hiccup silently
+   * undoes this whole module for the rest of the process's life.
+   */
+  workerDisabled: boolean;
+  /** Guards the process-level `beforeExit` hook so it is installed at most once,
+   *  however many times a worker (re)spawns. */
+  beforeExitHookInstalled: boolean;
+  beforeExitListener: (() => Promise<void>) | null;
 
-/**
- * Whether the worker is currently holding the event loop open. Mirrors the last
- * `ref()`/`unref()` we issued, because `Worker` exposes no way to read it back.
- */
-let _refd = false;
+  /**
+   * Whether the worker is currently holding the event loop open. Mirrors the last
+   * `ref()`/`unref()` we issued, because `Worker` exposes no way to read it back.
+   */
+  refd: boolean;
+  lastFallbackWarnAt: number;
+}
+
+// tsx can evaluate this module through both CJS and ESM in one process.
+// Shutdown and health reads must see the worker started through either loader.
+const state = pinModuleState<WorkerState>('@papercusp/rerank.local-reranker-worker', () => ({
+  worker: null, workerReady: null, nextId: 0, pending: new Map(),
+  workerDisabled: false, beforeExitHookInstalled: false, beforeExitListener: null,
+  refd: false, lastFallbackWarnAt: 0,
+}));
 
 /**
  * Hold the loop open for EXACTLY as long as a request is in flight, and not one
@@ -75,15 +87,15 @@ let _refd = false;
  * Measured 2026-08-10: a `scoreViaWorker` with ZERO pairs — no model load at
  * all — failed this way 100% of the time from a standalone script.
  *
- * Ref'ing only while `_pending` is non-empty satisfies both: a script that
+ * Ref'ing only while `state.pending` is non-empty satisfies both: a script that
  * awaits a rerank stays alive until its answer arrives, then exits naturally.
  */
 function syncWorkerRef(): void {
-  const want = _pending.size > 0;
-  if (!_worker || want === _refd) return;
-  if (want) _worker.ref();
-  else _worker.unref();
-  _refd = want;
+  const want = state.pending.size > 0;
+  if (!state.worker || want === state.refd) return;
+  if (want) state.worker.ref();
+  else state.worker.unref();
+  state.refd = want;
 }
 
 function workerPath(): string {
@@ -98,22 +110,22 @@ function workerPath(): string {
 }
 
 function ensureWorker(): Promise<void> {
-  if (_workerDisabled) return Promise.reject(new Error('rerank worker disabled'));
-  if (_workerReady) return _workerReady;
+  if (state.workerDisabled) return Promise.reject(new Error('rerank worker disabled'));
+  if (state.workerReady) return state.workerReady;
 
-  _workerReady = new Promise<void>((resolveReady, rejectReady) => {
+  state.workerReady = new Promise<void>((resolveReady, rejectReady) => {
     try {
-      _worker = new Worker(workerPath());
+      state.worker = new Worker(workerPath());
     } catch (err) {
       // Construction failed — genuinely unavailable, not a transient fault.
-      _workerDisabled = true;
-      _workerReady = null;
+      state.workerDisabled = true;
+      state.workerReady = null;
       rejectReady(err as Error);
       return;
     }
 
     let initialized = false;
-    _worker.on(
+    state.worker.on(
       'message',
       (msg: { kind: string; id?: number; scores?: number[]; error?: string }) => {
         if (msg.kind === 'ready') {
@@ -129,16 +141,16 @@ function ensureWorker(): Promise<void> {
           // A freshly constructed Worker is ref'd, so record that and let
           // `syncWorkerRef` decide: idle ⇒ unref (the behaviour above), a
           // request already in flight ⇒ stay ref'd until it answers (WI-37680).
-          _refd = true;
+          state.refd = true;
           syncWorkerRef();
           installBeforeExitHook();
           resolveReady();
           return;
         }
         if (typeof msg.id !== 'number') return;
-        const p = _pending.get(msg.id);
+        const p = state.pending.get(msg.id);
         if (!p) return;
-        _pending.delete(msg.id);
+        state.pending.delete(msg.id);
         // Release the loop as soon as the LAST request settles, so a one-off
         // script exits on its own.
         syncWorkerRef();
@@ -147,36 +159,36 @@ function ensureWorker(): Promise<void> {
       },
     );
 
-    _worker.on('error', (err) => {
+    state.worker.on('error', (err) => {
       // The worker crashed: fail every in-flight request, then clear the handle
-      // so the NEXT call respawns. Deliberately not `_workerDisabled` — see its
+      // so the NEXT call respawns. Deliberately not `state.workerDisabled` — see its
       // declaration.
-      for (const [, p] of _pending) p.reject(err);
-      _pending.clear();
-      _worker = null;
-      _workerReady = null;
-      _refd = false;
+      for (const [, p] of state.pending) p.reject(err);
+      state.pending.clear();
+      state.worker = null;
+      state.workerReady = null;
+      state.refd = false;
       if (!initialized) rejectReady(err);
     });
 
-    _worker.on('exit', (code) => {
+    state.worker.on('exit', (code) => {
       if (code !== 0 && !initialized) {
         rejectReady(new Error(`rerank worker exited with code ${code} before ready`));
       }
       // Reject anything still waiting — an exited worker will never answer it,
       // and a request left pending forever would hang the caller past its bound.
-      for (const [, p] of _pending) p.reject(new Error(`rerank worker exited with code ${code}`));
-      _pending.clear();
-      _worker = null;
-      _workerReady = null;
-      _refd = false;
+      for (const [, p] of state.pending) p.reject(new Error(`rerank worker exited with code ${code}`));
+      state.pending.clear();
+      state.worker = null;
+      state.workerReady = null;
+      state.refd = false;
     });
   }).catch((err) => {
-    _workerReady = null;
+    state.workerReady = null;
     throw err;
   });
 
-  return _workerReady;
+  return state.workerReady;
 }
 
 /** The resolved, worker-side scoring request. Device/dtype are resolved on the
@@ -199,16 +211,16 @@ export interface ScoreViaWorkerRequest {
  */
 export async function scoreViaWorker(req: ScoreViaWorkerRequest): Promise<number[]> {
   await ensureWorker();
-  if (!_worker) throw new Error('rerank worker not initialized');
+  if (!state.worker) throw new Error('rerank worker not initialized');
 
-  const id = _nextId++;
+  const id = state.nextId++;
   return new Promise<number[]>((resolveScore, rejectScore) => {
-    _pending.set(id, { resolve: resolveScore, reject: rejectScore });
+    state.pending.set(id, { resolve: resolveScore, reject: rejectScore });
     // Ref BEFORE posting: between the post and the reply the caller is awaiting
     // a Promise, which is not loop work — an unref'd worker would leave the loop
     // looking idle and let `beforeExit` terminate this very request.
     syncWorkerRef();
-    _worker!.postMessage({ kind: 'score', id, ...req });
+    state.worker!.postMessage({ kind: 'score', id, ...req });
   });
 }
 
@@ -217,27 +229,27 @@ export async function scoreViaWorker(req: ScoreViaWorkerRequest): Promise<number
  *  worker isolate's normal cleanup (including the ONNX addon's finalizers),
  *  which `process.exit()` skips. */
 export async function shutdownLocalReranker(): Promise<void> {
-  if (_worker) {
+  if (state.worker) {
     try {
-      await _worker.terminate();
+      await state.worker.terminate();
     } catch {
       /* noop */
     }
   }
-  _worker = null;
-  _workerReady = null;
-  _workerDisabled = false;
-  _refd = false;
-  _pending.clear();
-  _nextId = 0;
+  state.worker = null;
+  state.workerReady = null;
+  state.workerDisabled = false;
+  state.refd = false;
+  state.pending.clear();
+  state.nextId = 0;
 }
 
 /** Test seam — same function under the codebase's `_reset*` convention. */
 export const _resetRerankWorkerForTest = shutdownLocalReranker;
 
 function installBeforeExitHook(): void {
-  if (_beforeExitHookInstalled) return;
-  _beforeExitHookInstalled = true;
+  if (state.beforeExitHookInstalled) return;
+  state.beforeExitHookInstalled = true;
   // `beforeExit` (unlike `exit`) permits async work, which is required because
   // `terminate()` returns a Promise. It fires only once the loop would go idle,
   // which is exactly why the worker unrefs itself above.
@@ -247,18 +259,18 @@ function installBeforeExitHook(): void {
   // by design. It stays because the failure it prevents (terminating a worker
   // mid-request, which the caller then reads as "no worker available") is
   // silent, and because a future ref bug would otherwise re-open it.
-  _beforeExitListener = async () => {
-    if (_pending.size > 0) return;
+  state.beforeExitListener = async () => {
+    if (state.pending.size > 0) return;
     await shutdownLocalReranker();
   };
-  process.on('beforeExit', _beforeExitListener);
+  process.on('beforeExit', state.beforeExitListener);
 }
 
 /** Test-only: remove the installed hook and clear the guard. */
 export function _resetBeforeExitHookForTest(): void {
-  if (_beforeExitListener) process.off('beforeExit', _beforeExitListener);
-  _beforeExitListener = null;
-  _beforeExitHookInstalled = false;
+  if (state.beforeExitListener) process.off('beforeExit', state.beforeExitListener);
+  state.beforeExitListener = null;
+  state.beforeExitHookInstalled = false;
 }
 
 /** Telemetry for health checks and diagnostics. */
@@ -275,10 +287,10 @@ export function getRerankWorkerState(): {
   keepAlive: boolean;
 } {
   return {
-    alive: _worker !== null,
-    disabled: _workerDisabled,
-    pendingCount: _pending.size,
-    keepAlive: _refd,
+    alive: state.worker !== null,
+    disabled: state.workerDisabled,
+    pendingCount: state.pending.size,
+    keepAlive: state.refd,
   };
 }
 
@@ -287,12 +299,11 @@ export function getRerankWorkerState(): {
  * scoring. Every call retries the worker (a crashed one respawns), so a
  * SUSTAINED failure would otherwise warn on every single rerank.
  */
-let _lastFallbackWarnAt = 0;
 const FALLBACK_WARN_COOLDOWN_MS = 30_000;
 export function warnRerankFallback(err: unknown): void {
   const now = Date.now();
-  if (now - _lastFallbackWarnAt < FALLBACK_WARN_COOLDOWN_MS) return;
-  _lastFallbackWarnAt = now;
+  if (now - state.lastFallbackWarnAt < FALLBACK_WARN_COOLDOWN_MS) return;
+  state.lastFallbackWarnAt = now;
   if (process.env.NODE_ENV !== 'test') {
     console.warn(
       '[rerank] worker path failed — falling back to inline (main-thread, blocks the event loop) ' +
@@ -305,5 +316,5 @@ export function warnRerankFallback(err: unknown): void {
 
 /** Test-only: reset the fallback-warn cooldown. */
 export function _resetFallbackWarnForTest(): void {
-  _lastFallbackWarnAt = 0;
+  state.lastFallbackWarnAt = 0;
 }

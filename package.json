@@ -20,6 +20,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@papercusp/module-singleton": "*",
     "zeroentropy": "^0.1.0-alpha.10"
   },
   "peerDependencies": {
