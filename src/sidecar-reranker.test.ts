@@ -202,6 +202,46 @@ describe('buildSidecarFirstReranker — sidecar REQUIRED', () => {
     expect(fetchFn.mock.calls.length).toBeLessThan(10);
   });
 
+  it.each([
+    { label: 'caller-owned budget overrides the default', timeoutMs: undefined, deadline: 180_000, success: true },
+    { label: 'unconfigured caller retains the default', timeoutMs: undefined, deadline: undefined, success: false },
+    { label: 'explicit client cap remains authoritative', timeoutMs: 5_000, deadline: 180_000, success: false },
+    { label: 'tighter caller deadline remains authoritative', timeoutMs: 180_000, deadline: 5_000, success: false },
+  ])('$label for a batch longer than the default budget', async ({ timeoutMs, deadline, success }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    try {
+      const transitions: string[] = [];
+      const fetchFn = vi.fn((_url: string, init?: RequestInit) =>
+        new Promise<Response>((resolve, reject) => {
+          const timer = setTimeout(() => resolve(okResponse([0.8])), 16_000);
+          init?.signal?.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(new DOMException('This operation was aborted', 'AbortError'));
+          }, { once: true });
+        }),
+      );
+      const score = buildSidecarFirstReranker({
+        url: 'http://deadline-contract',
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        fetchFn: fetchFn as typeof fetch,
+        onTransition: state => transitions.push(state),
+      });
+      const outcome = score('q', ['a'], deadline === undefined ? undefined : { deadline }).then(
+        scores => ({ success: true, scores }),
+        error => ({ success: false, error: error.name }),
+      );
+      await vi.advanceTimersByTimeAsync(16_001);
+      expect(await outcome).toEqual(success
+        ? { success: true, scores: [0.8] }
+        : { success: false, error: 'RerankDeadlineError' });
+      expect(fetchFn).toHaveBeenCalledOnce();
+      expect(transitions).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reports an expired caller AbortError as a deadline, without a false outage transition', async () => {
     let now = 0;
     const transitions: string[] = [];
