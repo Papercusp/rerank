@@ -242,6 +242,13 @@ describe('buildSidecarFirstReranker — sidecar REQUIRED', () => {
     }
   });
 
+  it.each([NaN, Infinity, -Infinity])('rejects a non-finite caller deadline (%s) before dispatch', async deadline => {
+    const fetchFn = vi.fn(async () => okResponse([0.8]));
+    const score = buildSidecarFirstReranker({ url: 'http://deadline-contract', fetchFn: fetchFn as typeof fetch });
+    await expect(score('q', ['a'], { deadline })).rejects.toThrow('Rerank deadline must be finite');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
   it('reports an expired caller AbortError as a deadline, without a false outage transition', async () => {
     let now = 0;
     const transitions: string[] = [];
@@ -302,7 +309,9 @@ describe('the fail-safe seam converts a sidecar throw into retrieval order', () 
       fetchFn: (async () => {
         throw new Error('ECONNREFUSED');
       }) as unknown as typeof fetch,
-      now: fakeTiming().now,
+      // The outer rerank() creates an epoch deadline with Date.now(); both
+      // layers must share that clock rather than subtracting a zero epoch.
+      now: Date.now,
       sleepFn: async () => {},
       onTransition: () => {},
     });

@@ -287,8 +287,10 @@ export interface SidecarFirstRerankerOpts {
   /** Sidecar base URL; defaults to resolveRerankSidecarUrl(). null/absent ⇒
    *  pure in-process. */
   url?: string | null;
-  /** TOTAL sidecar budget per call across every attempt (default 15s), unless
-   * the caller supplies a tighter absolute deadline. */
+  /** Explicit TOTAL sidecar cap per call across every attempt. When omitted,
+   * the caller's absolute deadline owns the budget; 15s is the fallback only
+   * when neither caller nor client supplies a budget. An explicit cap still
+   * wins over a longer caller deadline. */
   timeoutMs?: number;
   /** Attempts within the budget on sidecar failure (default 3). */
   maxAttempts?: number;
@@ -356,8 +358,17 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
 
   return async (query: string, texts: string[], callOpts?: RerankScoreCallOpts): Promise<number[]> => {
     if (texts.length === 0) return [];
+    if (callOpts?.deadline !== undefined && !Number.isFinite(callOpts.deadline)) {
+      throw new RangeError('Rerank deadline must be finite');
+    }
     const ownDeadline = now() + timeoutMs;
-    const deadline = callOpts?.deadline === undefined ? ownDeadline : Math.min(callOpts.deadline, ownDeadline);
+    // A default is not a second, hidden cap. Batch consumers (e.g. Dream)
+    // already budget their whole review and pass the remaining time here.
+    const deadline = callOpts?.deadline === undefined
+      ? ownDeadline
+      : opts.timeoutMs === undefined
+        ? callOpts.deadline
+        : Math.min(callOpts.deadline, ownDeadline);
 
     return await admission.enqueue(texts.length, deadline, async () => {
       let lastErr: unknown;
