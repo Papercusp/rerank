@@ -363,7 +363,7 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
       let lastErr: unknown;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         const remaining = deadline - now();
-        if (remaining <= 0) break;
+        if (remaining <= 0) throw new RerankDeadlineError('Rerank deadline elapsed before a sidecar attempt');
         try {
           const res = await sidecarRerankBatch(url, {
             model,
@@ -380,6 +380,13 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
         } catch (e) {
           lastErr = e;
           if (isDeadlineFailure(e)) break;
+          // The request timer aborts fetch with AbortError, not our typed
+          // deadline error. Once our own deadline has elapsed, this says
+          // nothing about the sidecar's health and must not emit a down alarm.
+          if (now() >= deadline) {
+            lastErr = new RerankDeadlineError('Rerank deadline elapsed during the sidecar request');
+            break;
+          }
           if (isNonRetryableSidecarError(e)) {
             // Deterministic 4xx: the sidecar is UP and correctly rejecting THIS
             // request. Retrying the same payload can never succeed, so stop

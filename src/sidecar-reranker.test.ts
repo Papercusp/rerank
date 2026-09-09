@@ -198,8 +198,22 @@ describe('buildSidecarFirstReranker — sidecar REQUIRED', () => {
       maxAttempts: 10,
       onTransition: () => {},
     });
-    await expect(score('q', ['a'])).rejects.toThrow(/sidecar_required_unavailable/);
+    await expect(score('q', ['a'])).rejects.toThrow(/Rerank deadline/);
     expect(fetchFn.mock.calls.length).toBeLessThan(10);
+  });
+
+  it('reports an expired caller AbortError as a deadline, without a false outage transition', async () => {
+    let now = 0;
+    const transitions: string[] = [];
+    const fetchFn = vi.fn(async () => {
+      now = 5000;
+      throw new DOMException('This operation was aborted', 'AbortError');
+    });
+    const score = buildSidecarFirstReranker({ url: 'http://x', now: () => now,
+      fetchFn: fetchFn as typeof fetch, onTransition: state => transitions.push(state) });
+    await expect(score('q', ['a'], { deadline: 5000 })).rejects.toMatchObject({ name: 'RerankDeadlineError' });
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(transitions).toEqual([]);
   });
 
   it('serializes concurrent batches and sheds an impossible queued call before HTTP dispatch', async () => {
