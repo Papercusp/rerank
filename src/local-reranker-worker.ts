@@ -118,6 +118,11 @@ export function getOnnxBindingPin(): OnnxBindingPin | null {
   return state.onnxBindingPin ?? null;
 }
 
+/** Forget the recorded outcome (the binding stays loaded); for tests of a first-time pin. */
+export function _resetOnnxBindingPinForTest(): void {
+  state.onnxBindingPin = null;
+}
+
 /**
  * Hold the loop open for EXACTLY as long as a request is in flight, and not one
  * moment longer.
