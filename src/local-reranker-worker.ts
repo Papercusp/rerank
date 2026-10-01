@@ -19,6 +19,7 @@
 
 import { pinModuleState } from '@papercusp/module-singleton';
 import { Worker } from 'node:worker_threads';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname } from 'node:path';
 import type { RerankDevice } from './execution-target';
@@ -56,15 +57,66 @@ interface WorkerState {
    */
   refd: boolean;
   lastFallbackWarnAt: number;
+  /** Outcome of `pinOnnxRuntimeBinding` (WI-10005090); null until the first spawn. */
+  onnxBindingPin?: OnnxBindingPin | null;
 }
+
+/** What `pinOnnxRuntimeBinding` achieved. Never thrown — reported. */
+export type OnnxBindingPin =
+  | { status: 'pinned'; path: string }
+  | { status: 'unavailable'; reason: string }
+  | { status: 'failed'; reason: string };
 
 // tsx can evaluate this module through both CJS and ESM in one process.
 // Shutdown and health reads must see the worker started through either loader.
 const state = pinModuleState<WorkerState>('@papercusp/rerank.local-reranker-worker', () => ({
   worker: null, workerReady: null, nextId: 0, pending: new Map(),
   workerDisabled: false, beforeExitHookInstalled: false, beforeExitListener: null,
-  refd: false, lastFallbackWarnAt: 0,
+  refd: false, lastFallbackWarnAt: 0, onnxBindingPin: null,
 }));
+
+const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
+
+/**
+ * Load the onnxruntime-node binding once in the spawning thread, before any
+ * reranker worker loads it, and keep it for the life of the process.
+ *
+ * WI-10005090 (measured 2026-10-01, onnxruntime-node 1.24.3 / node 25.9): once
+ * the last thread holding the binding exits, Node drops its registration while
+ * the library stays mapped, so every later load in the process — a respawned
+ * worker and the inline main-thread fallback — fails with "Module did not
+ * self-register". Holding one reference keeps the registration. The embedder
+ * worker (libs/generic/memory/src/local-embedder-worker.ts, same function name)
+ * pins the same binding; the full measurement is documented there. Resolved
+ * from the transformers package the worker script imports, so the pinned file
+ * is the file the worker loads. Never throws; the first outcome stands.
+ */
+export function pinOnnxRuntimeBinding(fromPath: string): OnnxBindingPin {
+  if (!state.onnxBindingPin) state.onnxBindingPin = loadOnnxBindingFrom(fromPath);
+  return state.onnxBindingPin;
+}
+
+function loadOnnxBindingFrom(fromPath: string): OnnxBindingPin {
+  let transformersEntry: string;
+  try {
+    transformersEntry = createRequire(fromPath).resolve(TRANSFORMERS_PACKAGE);
+  } catch {
+    return { status: 'unavailable', reason: `${TRANSFORMERS_PACKAGE} is not resolvable from ${fromPath}` };
+  }
+  try {
+    const fromTransformers = createRequire(transformersEntry);
+    const path = fromTransformers.resolve('onnxruntime-node');
+    fromTransformers('onnxruntime-node');
+    return { status: 'pinned', path };
+  } catch (err) {
+    return { status: 'failed', reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** The pin outcome, or null when no reranker worker has been spawned yet. */
+export function getOnnxBindingPin(): OnnxBindingPin | null {
+  return state.onnxBindingPin ?? null;
+}
 
 /**
  * Hold the loop open for EXACTLY as long as a request is in flight, and not one
@@ -115,7 +167,10 @@ function ensureWorker(): Promise<void> {
 
   state.workerReady = new Promise<void>((resolveReady, rejectReady) => {
     try {
-      state.worker = new Worker(workerPath());
+      const scriptPath = workerPath();
+      // WI-10005090: before the first worker can load (and later release) the binding.
+      pinOnnxRuntimeBinding(scriptPath);
+      state.worker = new Worker(scriptPath);
     } catch (err) {
       // Construction failed — genuinely unavailable, not a transient fault.
       state.workerDisabled = true;
