@@ -319,10 +319,19 @@ export interface SidecarFirstRerankerOpts {
  *  `Promise.race` subscribes to `work`, a late rejection is never unhandled.
  *  (The embedder client in @papercusp/memory has the same helper. This
  *  library does not depend on that one, so it keeps its own copy.) */
-async function settleEnsureWithin(work: Promise<unknown>, ms: number): Promise<void> {
+/** P-530: an ensure hook may resolve to the sidecar's CURRENT base URL (a
+ *  sidecar spawned on an ephemeral port comes back on a different port after
+ *  an idle exit). Anything that is not a non-empty string keeps `current`.
+ *  Same rule as nextSidecarUrl in @papercusp/memory; kept local for the same
+ *  reason as the settle helper below. */
+export function nextRerankSidecarUrl(current: string, ensured: unknown): string {
+  return typeof ensured === 'string' && ensured.trim() ? ensured.trim().replace(/\/$/, '') : current;
+}
+
+async function settleEnsureWithin<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await Promise.race([
+    return await Promise.race([
       work,
       new Promise<never>((_, reject) => {
         timer = setTimeout(
@@ -383,6 +392,11 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
   const fetchFn = opts.fetchFn ?? fetch;
   const admission = sidecarAdmissionGateFor(url, model, fetchFn, now);
   let wasDown = false;
+  // P-530: an ensure hook may report a new address (a sidecar re-launched on a
+  // fresh ephemeral port after an idle exit). Shared across calls so later
+  // calls start there. The admission gate stays keyed by the first URL: it
+  // still guards the same logical sidecar for this process.
+  let currentUrl = url;
 
   return async (query: string, texts: string[], callOpts?: RerankScoreCallOpts): Promise<number[]> => {
     if (texts.length === 0) return [];
@@ -406,11 +420,11 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
         try {
           let left = remaining;
           if (opts.ensure) {
-            await settleEnsureWithin(opts.ensure(), remaining);
+            currentUrl = nextRerankSidecarUrl(currentUrl, await settleEnsureWithin(opts.ensure(), remaining));
             left = deadline - now();
             if (left <= 0) throw new RerankDeadlineError('Rerank deadline elapsed while re-establishing the sidecar');
           }
-          const res = await sidecarRerankBatch(url, {
+          const res = await sidecarRerankBatch(currentUrl, {
             model,
             query,
             texts,
@@ -458,12 +472,12 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
       throw isNonRetryableSidecarError(lastErr)
         ? new Error(
             `sidecar_rejected_request: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
-              `(${url}, ${model}) — the sidecar rejected this request (non-retryable); ` +
+              `(${currentUrl}, ${model}) — the sidecar rejected this request (non-retryable); ` +
               'check payload shape/size — this is not a downtime issue',
           )
         : new Error(
             `sidecar_required_unavailable: ${lastErr instanceof Error ? lastErr.message : String(lastErr)} ` +
-              `(${url}, ${model}, budget ${timeoutMs}ms) — reranking requires the sidecar; ` +
+              `(${currentUrl}, ${model}, budget ${timeoutMs}ms) — reranking requires the sidecar; ` +
               'search degrades to retrieval order while it is down',
           );
     });
