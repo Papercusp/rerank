@@ -306,6 +306,34 @@ export interface SidecarFirstRerankerOpts {
    *  correctly refusing a bad request — distinct from 'down' so the log never
    *  claims unavailability when the sidecar is fine. */
   onTransition?: (state: 'down' | 'up' | 'rejected', detail: string) => void;
+  /** Re-establish the sidecar before each attempt. A sidecar this process
+   *  spawned may have exited after an idle period, and this hook re-launches
+   *  it on demand. It should be cheap when the sidecar is already running.
+   *  It runs inside the call's deadline. If the deadline passes first, the
+   *  ensure keeps running, so a later call finds the sidecar warming or ready.
+   *  Leave unset for a sidecar another process owns. */
+  ensure?: () => Promise<unknown>;
+}
+
+/** Settle `work` within `ms`, or reject. A late settle is ignored, and because
+ *  `Promise.race` subscribes to `work`, a late rejection is never unhandled.
+ *  (The embedder client in @papercusp/memory has the same helper. This
+ *  library does not depend on that one, so it keeps its own copy.) */
+async function settleEnsureWithin(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`sidecar_ensure_timeout: sidecar not ready within ${Math.max(0, Math.round(ms))}ms`)),
+          Math.max(0, ms),
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -376,11 +404,17 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
         const remaining = deadline - now();
         if (remaining <= 0) throw new RerankDeadlineError('Rerank deadline elapsed before a sidecar attempt');
         try {
+          let left = remaining;
+          if (opts.ensure) {
+            await settleEnsureWithin(opts.ensure(), remaining);
+            left = deadline - now();
+            if (left <= 0) throw new RerankDeadlineError('Rerank deadline elapsed while re-establishing the sidecar');
+          }
           const res = await sidecarRerankBatch(url, {
             model,
             query,
             texts,
-            timeoutMs: remaining,
+            timeoutMs: left,
             fetchFn,
           });
           if (wasDown) {
