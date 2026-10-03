@@ -285,7 +285,7 @@ export interface SidecarFirstRerankerOpts {
   /** In-process dtype, used only when no sidecar is configured. */
   dtype?: string;
   /** Sidecar base URL; defaults to resolveRerankSidecarUrl(). null/absent ⇒
-   *  pure in-process. */
+   *  pure in-process, unless `ensure` is set (see there). */
   url?: string | null;
   /** Explicit TOTAL sidecar cap per call across every attempt. When omitted,
    * the caller's absolute deadline owns the budget; 15s is the fallback only
@@ -311,9 +311,16 @@ export interface SidecarFirstRerankerOpts {
    *  it on demand. It should be cheap when the sidecar is already running.
    *  It runs inside the call's deadline. If the deadline passes first, the
    *  ensure keeps running, so a later call finds the sidecar warming or ready.
-   *  Leave unset for a sidecar another process owns. */
+   *  Leave unset for a sidecar another process owns.
+   *  With `url` null, the ensure hook is the ONLY source of the address (a
+   *  sidecar this process is configured to spawn that is not up yet). The
+   *  client stays sidecar-only until an ensure reports a URL and never loads
+   *  the cross-encoder in-process (WI-10005932). */
   ensure?: () => Promise<unknown>;
 }
+
+/** WI-10005932: admission-lane key for a spawned sidecar whose address is not known yet. */
+const PENDING_SPAWNED_SIDECAR_KEY = 'spawned-sidecar:pending';
 
 /** Settle `work` within `ms`, or reject. A late settle is ignored, and because
  *  `Promise.race` subscribes to `work`, a late rejection is never unhandled.
@@ -324,7 +331,9 @@ export interface SidecarFirstRerankerOpts {
  *  an idle exit). Anything that is not a non-empty string keeps `current`.
  *  Same rule as nextSidecarUrl in @papercusp/memory; kept local for the same
  *  reason as the settle helper below. */
-export function nextRerankSidecarUrl(current: string, ensured: unknown): string {
+export function nextRerankSidecarUrl(current: string, ensured: unknown): string;
+export function nextRerankSidecarUrl(current: string | null, ensured: unknown): string | null;
+export function nextRerankSidecarUrl(current: string | null, ensured: unknown): string | null {
   return typeof ensured === 'string' && ensured.trim() ? ensured.trim().replace(/\/$/, '') : current;
 }
 
@@ -363,7 +372,7 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
     ((state: 'down' | 'up' | 'rejected', detail: string) =>
       console.warn(`[sidecar-reranker] ${model} sidecar ${state}: ${detail}`));
 
-  if (!url) {
+  if (!url && !opts.ensure) {
     // No sidecar configured: the in-process engine is the sole engine.
     //
     // `dtype` is forwarded ONLY when the caller actually set one. Defaulting it
@@ -390,13 +399,13 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
   }
 
   const fetchFn = opts.fetchFn ?? fetch;
-  const admission = sidecarAdmissionGateFor(url, model, fetchFn, now);
+  const admission = sidecarAdmissionGateFor(url || PENDING_SPAWNED_SIDECAR_KEY, model, fetchFn, now);
   let wasDown = false;
   // P-530: an ensure hook may report a new address (a sidecar re-launched on a
   // fresh ephemeral port after an idle exit). Shared across calls so later
   // calls start there. The admission gate stays keyed by the first URL: it
   // still guards the same logical sidecar for this process.
-  let currentUrl = url;
+  let currentUrl: string | null = url || null;
 
   return async (query: string, texts: string[], callOpts?: RerankScoreCallOpts): Promise<number[]> => {
     if (texts.length === 0) return [];
@@ -424,6 +433,7 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
             left = deadline - now();
             if (left <= 0) throw new RerankDeadlineError('Rerank deadline elapsed while re-establishing the sidecar');
           }
+          if (currentUrl === null) throw new Error('sidecar_not_ready: no sidecar address reported yet');
           const res = await sidecarRerankBatch(currentUrl, {
             model,
             query,
