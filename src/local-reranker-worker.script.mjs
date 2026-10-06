@@ -128,10 +128,31 @@ async function score(msg) {
   return scores;
 }
 
+// WI-10006567 (mirrors the embed worker): `Worker#terminate()` while an
+// onnxruntime-node run is in flight aborts the whole PROCESS (an uncatchable
+// Napi::Error -> SIGABRT). The host therefore never terminates a worker that
+// owes answers: it sends {kind:'retire'}, this thread starts no new scoring,
+// finishes what is running, and answers {kind:'retired'} once idle.
+let retired = false;
+let retiredAnnounced = false;
+let inFlight = 0;
+function announceRetiredIfIdle() {
+  if (!retired || inFlight > 0 || retiredAnnounced) return;
+  retiredAnnounced = true;
+  parentPort.postMessage({ kind: 'retired' });
+}
+
 parentPort.on('message', async (msg) => {
   if (!msg || typeof msg !== 'object') return;
+  if (msg.kind === 'retire') {
+    retired = true;
+    announceRetiredIfIdle();
+    return;
+  }
   if (msg.kind !== 'score') return;
+  inFlight++;
   try {
+    if (retired) throw new Error('rerank worker retired before this request started scoring');
     parentPort.postMessage({ kind: 'score_ok', id: msg.id, scores: await score(msg) });
   } catch (err) {
     parentPort.postMessage({
@@ -139,6 +160,9 @@ parentPort.on('message', async (msg) => {
       id: msg.id,
       error: err && err.message ? err.message : String(err),
     });
+  } finally {
+    inFlight--;
+    announceRetiredIfIdle();
   }
 });
 

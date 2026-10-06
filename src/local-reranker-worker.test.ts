@@ -55,6 +55,9 @@ describe('local rerank worker (real thread)', () => {
       second = await import('./local-reranker-worker');
       expect(second.scoreViaWorker).not.toBe(first.scoreViaWorker);
       expect(second.getRerankWorkerState()).toEqual(first.getRerankWorkerState());
+      // Restore delivery first: a worker that owes an answer is retired, not
+      // killed (WI-10006567), and the retire request must reach it.
+      post.mockRestore();
       await second.shutdownLocalReranker();
       expect(await pending).toBeInstanceOf(Error);
       expect(first.getRerankWorkerState()).toMatchObject({ alive: false, pendingCount: 0 });

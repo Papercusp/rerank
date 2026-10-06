@@ -59,7 +59,19 @@ interface WorkerState {
   lastFallbackWarnAt: number;
   /** Outcome of `pinOnnxRuntimeBinding` (WI-10005090); null until the first spawn. */
   onnxBindingPin?: OnnxBindingPin | null;
+  /** Workers detached while they owed answers, draining before terminate
+   *  (WI-10006567; mirrors the embedder's `retiring`). */
+  retiring?: Map<Worker, RetiringWorker>;
 }
+
+type RetireOutcome = 'retired' | 'exited' | 'errored' | 'timed-out';
+interface RetiringWorker {
+  done: Promise<void>;
+  settle: (outcome: RetireOutcome) => void;
+}
+
+/** Bound on waiting for a retiring rerank worker's in-flight scoring (WI-10006567). */
+export const RERANK_WORKER_RETIRE_DRAIN_MS = 30_000;
 
 /** What `pinOnnxRuntimeBinding` achieved. Never thrown — reported. */
 export type OnnxBindingPin =
@@ -171,11 +183,12 @@ function ensureWorker(): Promise<void> {
   if (state.workerReady) return state.workerReady;
 
   state.workerReady = new Promise<void>((resolveReady, rejectReady) => {
+    let spawned: Worker;
     try {
       const scriptPath = workerPath();
       // WI-10005090: before the first worker can load (and later release) the binding.
       pinOnnxRuntimeBinding(scriptPath);
-      state.worker = new Worker(scriptPath);
+      spawned = new Worker(scriptPath);
     } catch (err) {
       // Construction failed — genuinely unavailable, not a transient fault.
       state.workerDisabled = true;
@@ -183,11 +196,22 @@ function ensureWorker(): Promise<void> {
       rejectReady(err as Error);
       return;
     }
+    // WI-10006567: handlers are scoped to THIS worker. A shutdown detaches a
+    // worker that owes answers and lets it drain; request ids restart at 0, so
+    // its late `score_ok` must never reach the replacement's pending map, and its
+    // late `exit` must never null the live handle.
+    const w = spawned;
+    state.worker = w;
 
     let initialized = false;
-    state.worker.on(
+    w.on(
       'message',
       (msg: { kind: string; id?: number; scores?: number[]; error?: string }) => {
+        if (state.worker !== w) {
+          if (msg.kind === 'retired') state.retiring?.get(w)?.settle('retired');
+          else if (msg.kind === 'ready') rejectReady(new Error('rerank worker was shut down before it became ready'));
+          return;
+        }
         if (msg.kind === 'ready') {
           initialized = true;
           // A REF'd worker keeps the event loop alive forever, so a one-off
@@ -219,7 +243,9 @@ function ensureWorker(): Promise<void> {
       },
     );
 
-    state.worker.on('error', (err) => {
+    w.on('error', (err) => {
+      if (!initialized) rejectReady(err);
+      if (state.worker !== w) { state.retiring?.get(w)?.settle('errored'); return; }
       // The worker crashed: fail every in-flight request, then clear the handle
       // so the NEXT call respawns. Deliberately not `state.workerDisabled` — see its
       // declaration.
@@ -228,13 +254,13 @@ function ensureWorker(): Promise<void> {
       state.worker = null;
       state.workerReady = null;
       state.refd = false;
-      if (!initialized) rejectReady(err);
     });
 
-    state.worker.on('exit', (code) => {
+    w.on('exit', (code) => {
       if (code !== 0 && !initialized) {
         rejectReady(new Error(`rerank worker exited with code ${code} before ready`));
       }
+      if (state.worker !== w) { state.retiring?.get(w)?.settle('exited'); return; }
       // Reject anything still waiting — an exited worker will never answer it,
       // and a request left pending forever would hang the caller past its bound.
       for (const [, p] of state.pending) p.reject(new Error(`rerank worker exited with code ${code}`));
@@ -288,20 +314,58 @@ export async function scoreViaWorker(req: ScoreViaWorkerRequest): Promise<number
  *  explicit `process.exit()` in a standalone script — `terminate()` runs the
  *  worker isolate's normal cleanup (including the ONNX addon's finalizers),
  *  which `process.exit()` skips. */
-export async function shutdownLocalReranker(): Promise<void> {
-  if (state.worker) {
-    try {
-      await state.worker.terminate();
-    } catch {
-      /* noop */
-    }
-  }
+export async function shutdownLocalReranker(opts: { drainMs?: number } = {}): Promise<void> {
+  const old = state.worker;
+  const owed = state.pending.size;
+  // Detach first (WI-10006567): the old worker's handlers stop touching module
+  // state, and the next score spawns a replacement instead of waiting the drain.
   state.worker = null;
   state.workerReady = null;
   state.workerDisabled = false;
   state.refd = false;
+  // Reject, never silently drop: a cleared-but-unsettled request hangs its caller.
+  if (state.pending.size > 0) {
+    const err = new Error(`rerank worker was shut down while ${state.pending.size} request(s) were in flight`);
+    for (const [, p] of state.pending) p.reject(err);
+  }
   state.pending.clear();
   state.nextId = 0;
+  if (old) {
+    // A worker that owed answers may be mid-run; terminating it then aborts the
+    // process. `opts?.`: a `.then(shutdownLocalReranker)` can pass null.
+    if (owed > 0) void retireWorker(old, opts?.drainMs ?? RERANK_WORKER_RETIRE_DRAIN_MS);
+    else { try { await old.terminate(); } catch { /* already gone */ } }
+  }
+  // Resolves only once no worker of this module is alive, including one an
+  // earlier shutdown is still retiring.
+  await Promise.all([...(state.retiring?.values() ?? [])].map((r) => r.done));
+}
+
+/** Terminate a detached worker only once it reports no scoring in flight, bounded
+ *  by `drainMs` (WI-10006567; the embedder's `retireWorker` documents why). */
+function retireWorker(w: Worker, drainMs: number): Promise<void> {
+  const retiring = (state.retiring ??= new Map());
+  const existing = retiring.get(w);
+  if (existing) return existing.done;
+  let settle: (outcome: RetireOutcome) => void = () => {};
+  const outcome = new Promise<RetireOutcome>((resolve) => { settle = resolve; });
+  const timer = setTimeout(() => settle('timed-out'), drainMs);
+  timer.unref?.();
+  const done = outcome.then(async (how) => {
+    clearTimeout(timer);
+    if (how === 'timed-out') {
+      console.warn(`[rerank-worker] retiring worker did not report retired within ${drainMs}ms; terminating it anyway `
+        + '(WI-10006567: terminating during a native run can abort the process)');
+    }
+    if (how !== 'exited') {
+      try { await w.terminate(); } catch { /* already gone */ }
+    }
+    retiring.delete(w);
+  });
+  retiring.set(w, { done, settle });
+  try { w.ref(); } catch { /* exiting already; its exit handler settles */ }
+  try { w.postMessage({ kind: 'retire' }); } catch { settle('errored'); }
+  return done;
 }
 
 /** Test seam — same function under the codebase's `_reset*` convention. */
