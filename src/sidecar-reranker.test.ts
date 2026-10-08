@@ -14,6 +14,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   RERANK_SIDECAR_URL_ENV,
+  DEFAULT_SIDECAR_TIMEOUT_MS,
   SIDECAR_MAX_TEXT_CHARS,
   SidecarRerankHttpError,
   buildSidecarFirstReranker,
@@ -247,6 +248,35 @@ describe('buildSidecarFirstReranker — sidecar REQUIRED', () => {
     const score = buildSidecarFirstReranker({ url: 'http://deadline-contract', fetchFn: fetchFn as typeof fetch });
     await expect(score('q', ['a'], { deadline })).rejects.toThrow('Rerank deadline must be finite');
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('does not multiply fixed request latency into an unobserved batch size, and remeasures stale estimates', async () => {
+    let clock = 0;
+    let slow = true;
+    const fetchFn = vi.fn(async (_url: unknown, init: RequestInit | undefined) => {
+      const texts = JSON.parse(String(init?.body)).texts;
+      clock += slow ? 5600 : 10;
+      return new Response(JSON.stringify({ scores: texts.map(() => 0.8), runtime: 'fixture', modelRev: 'fixture' }));
+    });
+    const score = buildSidecarFirstReranker({ url: 'http://batch-size-calibration', now: () => clock,
+      fetchFn: fetchFn as typeof fetch });
+    await expect(score('warm', ['one'], { deadline: 15000 })).resolves.toEqual([0.8]);
+    await Promise.resolve();
+    await Promise.resolve();
+    slow = false;
+    // A 5.6s single request does not prove that four pairs need 22.4s.
+    await expect(score('four', ['a', 'b', 'c', 'd'], { deadline: clock + 4000 }))
+      .resolves.toEqual([0.8, 0.8, 0.8, 0.8]);
+    await Promise.resolve();
+    await Promise.resolve();
+    // CONTROL: a recent measured slow request of this exact size is refused.
+    await expect(score('recent-one', ['one'], { deadline: clock + 4000 })).rejects.toThrow(/deadline exceeded/);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    clock += DEFAULT_SIDECAR_TIMEOUT_MS;
+    // A hard refusal cannot keep a stale estimate alive forever. The same
+    // short deadline now admits a bounded probe and learns the recovered cost.
+    await expect(score('recovered-one', ['one'], { deadline: clock + 4000 })).resolves.toEqual([0.8]);
+    expect(fetchFn).toHaveBeenCalledTimes(3);
   });
 
   it('reports an expired caller AbortError as a deadline, without a false outage transition', async () => {

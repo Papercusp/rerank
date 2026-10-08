@@ -167,15 +167,17 @@ interface SidecarAdmissionGate {
 /**
  * The sidecar's default scorer is one serialized inference resource. A
  * per-scorer HTTP queue keeps concurrent callers from piling whole batches
- * into the server FIFO, and the measured cost of the last successful batch
- * lets the queue shed a call that cannot fit its remaining deadline before it
- * opens a socket. This is deliberately a separate gate from scorer-gate.ts:
+ * into the server FIFO. Recent observations of the SAME batch size can shed
+ * a call before it opens a socket. HTTP latency includes fixed queue/ensure
+ * costs, so it cannot be divided by pair count and extrapolated to an unseen
+ * batch size. Expired observations are unknown, allowing a bounded new sample.
+ * This is deliberately a separate gate from scorer-gate.ts:
  * the latter protects local CPU, while this one protects the remote sidecar.
  */
 function createSidecarAdmissionGate(now: () => number): SidecarAdmissionGate {
   let active = false;
   const waiting: SidecarAdmissionEntry[] = [];
-  let msPerPair: number | null = null;
+  const batchCosts = new Map<number, { elapsedMs: number; measuredAt: number }>();
 
   const deadlineError = (entry: SidecarAdmissionEntry, remaining: number, predictedMs: number | null): Error =>
     new RerankDeadlineError(
@@ -189,8 +191,13 @@ function createSidecarAdmissionGate(now: () => number): SidecarAdmissionGate {
     const entry = waiting.shift();
     if (!entry) return;
 
-    const remaining = entry.deadline - now();
-    const predictedMs = msPerPair === null ? null : Math.ceil(msPerPair * entry.pairs);
+    const instant = now();
+    const remaining = entry.deadline - instant;
+    for (const [pairs, cost] of batchCosts) {
+      if (instant - cost.measuredAt >= DEFAULT_SIDECAR_TIMEOUT_MS) batchCosts.delete(pairs);
+    }
+    const observed = batchCosts.get(entry.pairs);
+    const predictedMs = observed ? Math.ceil(observed.elapsedMs) : null;
     if (remaining <= 0 || (predictedMs !== null && predictedMs > remaining)) {
       entry.reject(deadlineError(entry, remaining, predictedMs));
       // A queue can contain several calls whose deadlines have already
@@ -216,8 +223,11 @@ function createSidecarAdmissionGate(now: () => number): SidecarAdmissionGate {
         if (completed) {
           const elapsed = Math.max(0, now() - startedAt);
           if (elapsed > 0 && entry.pairs > 0) {
-            const sample = elapsed / entry.pairs;
-            msPerPair = msPerPair === null ? sample : msPerPair * 0.3 + sample * 0.7;
+            const prior = batchCosts.get(entry.pairs);
+            batchCosts.set(entry.pairs, { elapsedMs: prior ? prior.elapsedMs * 0.3 + elapsed * 0.7 : elapsed,
+              measuredAt: now() });
+            // Bound bookkeeping even for clients with unusual batch sizes.
+            if (batchCosts.size > 128) batchCosts.delete(batchCosts.keys().next().value!);
           }
         }
         active = false;
