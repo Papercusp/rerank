@@ -136,13 +136,14 @@ interface TransformersModule {
 
 const TRANSFORMERS_PACKAGE = '@huggingface/transformers';
 
-// Dodge bundler static analysis so the optional @huggingface dependency is only
-// required when the local engine is actually selected. Same idiom as the local
-// embedder — a static import would force every consumer of this lib (including
-// ones that only use the hosted engine) to install ONNX Runtime.
-const dynamicImport = new Function('specifier', 'return import(specifier)') as <T>(
-  specifier: string,
-) => Promise<T>;
+// Keep the optional dependency lazy and opaque to bundlers through a runtime
+// specifier. Native import retains the host callback in VM module runners;
+// new Function loses it and falsely reports an installed engine unavailable.
+// This is the native-import leg of memory's existing optional-import seam,
+// kept local so this standalone library does not depend on the memory stack.
+async function dynamicImport<T>(specifier: string): Promise<T> {
+  return (await import(/* @vite-ignore */ specifier)) as T;
+}
 
 interface LoadedModel {
   tokenizer: Tokenizer;
