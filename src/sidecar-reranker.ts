@@ -33,7 +33,7 @@
  * one-sided fix is the real risk).
  */
 
-import { LOCAL_RERANKER_MODEL, scoreCrossEncoder } from './local-engine';
+import { LOCAL_RERANKER_MODEL, scoreCrossEncoder, type LocalRerankOptions } from './local-engine';
 import { RerankDeadlineError, isDeadlineFailure } from './scorer-gate';
 
 /**
@@ -288,6 +288,8 @@ function sidecarAdmissionGateFor(
 }
 
 export interface SidecarFirstRerankerOpts {
+  /** Host observation seam for the configured in-process scorer. */
+  observeFallback?: LocalRerankOptions['observeFallback'];
   /** Sidecar-side model name ('rerank' | 'rerank-fast'). */
   model?: string;
   /** In-process model id, used only when no sidecar is configured. */
@@ -395,6 +397,7 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
       opts.localScorer ??
       ((query: string, texts: string[], callOpts?: RerankScoreCallOpts) =>
         scoreCrossEncoder(query, texts, {
+          observeFallback: opts.observeFallback,
           model: opts.localModel ?? LOCAL_RERANKER_MODEL,
           ...(opts.dtype === undefined ? {} : { dtype: opts.dtype }),
           // THE path EI-20005411672741677 is about: no sidecar ⇒ this in-process

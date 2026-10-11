@@ -38,7 +38,7 @@ const ORT_SESSION_OPTIONS = { intraOpNumThreads: 4, interOpNumThreads: 1 };
  *  milliseconds, so this cache is the difference between usable and unusable. */
 const modelsByKey = new Map();
 
-async function getModel(model, dtype, device) {
+async function getModel(model, dtype, device, observeFallback) {
   const key = `${model}::${dtype}::${device}`;
   let loaded = modelsByKey.get(key);
   if (!loaded) {
@@ -54,6 +54,12 @@ async function getModel(model, dtype, device) {
         }),
       ]);
       return { tokenizer, model: classifier };
+    }).then((result) => {
+      if (device !== 'cpu') observeFallback({ eligible: 1, applied: 1, reason: 'applied' });
+      return result;
+    }, (error) => {
+      if (device !== 'cpu') observeFallback({ eligible: 1, applied: 0, reason: 'gpu-construction-failed' });
+      throw error;
     });
     modelsByKey.set(key, loaded);
     // De-cache a failed load so a transient failure (half-downloaded model, cold
@@ -88,7 +94,8 @@ async function score(msg) {
     );
   }
 
-  const { tokenizer, model: classifier } = await getModel(model, dtype, device);
+  const { tokenizer, model: classifier } = await getModel(model, dtype, device, (decision) =>
+    parentPort.postMessage({ kind: 'device_decision', id: msg.id, decision }));
   const size = Math.max(1, batchSize);
   const scores = [];
 

@@ -27,6 +27,7 @@ import type { RerankDevice } from './execution-target';
 interface PendingRequest {
   resolve: (v: number[]) => void;
   reject: (err: Error) => void;
+  observeFallback?: ScoreViaWorkerRequest['observeFallback'];
 }
 
 interface WorkerState {
@@ -206,7 +207,7 @@ function ensureWorker(): Promise<void> {
     let initialized = false;
     w.on(
       'message',
-      (msg: { kind: string; id?: number; scores?: number[]; error?: string }) => {
+      (msg: { kind: string; id?: number; scores?: number[]; error?: string; decision?: { eligible: number; applied: number; reason: string } }) => {
         if (state.worker !== w) {
           if (msg.kind === 'retired') state.retiring?.get(w)?.settle('retired');
           else if (msg.kind === 'ready') rejectReady(new Error('rerank worker was shut down before it became ready'));
@@ -234,6 +235,10 @@ function ensureWorker(): Promise<void> {
         if (typeof msg.id !== 'number') return;
         const p = state.pending.get(msg.id);
         if (!p) return;
+        if (msg.kind === 'device_decision' && msg.decision) {
+          try { p.observeFallback?.('rerank-device', msg.decision); } catch { /* no-throw host sink */ }
+          return;
+        }
         state.pending.delete(msg.id);
         // Release the loop as soon as the LAST request settles, so a one-off
         // script exits on its own.
@@ -281,6 +286,7 @@ function ensureWorker(): Promise<void> {
  *  MAIN thread and passed explicitly, so the engine's GPU-demotion logic stays
  *  in exactly one place rather than being duplicated across the thread seam. */
 export interface ScoreViaWorkerRequest {
+  observeFallback?: (mechanism: string, decision: { eligible: number; applied: number; reason: string }) => unknown;
   query: string;
   texts: string[];
   model: string;
@@ -301,12 +307,13 @@ export async function scoreViaWorker(req: ScoreViaWorkerRequest): Promise<number
 
   const id = state.nextId++;
   return new Promise<number[]>((resolveScore, rejectScore) => {
-    state.pending.set(id, { resolve: resolveScore, reject: rejectScore });
+    const { observeFallback, ...payload } = req;
+    state.pending.set(id, { resolve: resolveScore, reject: rejectScore, observeFallback });
     // Ref BEFORE posting: between the post and the reply the caller is awaiting
     // a Promise, which is not loop work — an unref'd worker would leave the loop
     // looking idle and let `beforeExit` terminate this very request.
     syncWorkerRef();
-    state.worker!.postMessage({ kind: 'score', id, ...req });
+    state.worker!.postMessage({ kind: 'score', id, ...payload });
   });
 }
 
@@ -424,7 +431,8 @@ export function getRerankWorkerState(): {
  * SUSTAINED failure would otherwise warn on every single rerank.
  */
 const FALLBACK_WARN_COOLDOWN_MS = 30_000;
-export function warnRerankFallback(err: unknown): void {
+export function warnRerankFallback(err: unknown, observeFallback?: (mechanism: string, decision: { eligible: number; applied: number; reason: string }) => unknown): void {
+  try { observeFallback?.('rerank-worker', { eligible: 1, applied: 0, reason: 'worker-failed' }); } catch { /* no-throw host sink */ }
   const now = Date.now();
   if (now - state.lastFallbackWarnAt < FALLBACK_WARN_COOLDOWN_MS) return;
   state.lastFallbackWarnAt = now;

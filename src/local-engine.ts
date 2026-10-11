@@ -79,6 +79,8 @@ export const DEFAULT_MAX_LENGTH = 512;
 export const DEFAULT_BATCH_SIZE = 16;
 
 export interface LocalRerankOptions {
+  /** Optional domain-free host sink for actual device and worker decisions. */
+  observeFallback?: (mechanism: string, decision: { eligible: number; applied: number; reason: string }) => unknown;
   /** HF model id. Default `LOCAL_RERANKER_MODEL`. */
   model?: string;
   /**
@@ -194,7 +196,7 @@ async function defaultLoader(model: string, dtype: string, device: RerankDevice)
  * model, a cold network) does not poison the process for its whole lifetime.
  */
 export function loadCrossEncoder(opts: LocalRerankOptions = {}): Promise<LoadedModel> {
-  return loadOnTarget(opts.model ?? LOCAL_RERANKER_MODEL, effectiveTarget(opts));
+  return loadOnTarget(opts.model ?? LOCAL_RERANKER_MODEL, effectiveTarget(opts), opts.observeFallback);
 }
 
 /**
@@ -237,7 +239,8 @@ let _demotion: { from: RerankExecutionTarget; cause: string; target: RerankExecu
 
 /** Reported once per process when a GPU target is demoted, so the fallback is
  *  visible in a log instead of silently costing quality. */
-function reportDemotion(target: RerankExecutionTarget, err: unknown): void {
+function reportDemotion(target: RerankExecutionTarget, err: unknown, observeFallback?: LocalRerankOptions['observeFallback']): void {
+  try { observeFallback?.('rerank-device', { eligible: 1, applied: 0, reason: 'gpu-construction-failed' }); } catch { /* no-throw sink */ }
   const cause = String((err as Error)?.message ?? err).slice(0, 200);
   _demotion = { from: target, cause, target: demotedTarget(target, cause) };
   console.warn(
@@ -255,20 +258,28 @@ function reportDemotion(target: RerankExecutionTarget, err: unknown): void {
  * provider, which is the single worst configuration available and is exactly
  * what a naive "GPU didn't work, use the CPU" retry produces.
  */
-function loadOnTarget(model: string, target: RerankExecutionTarget): Promise<LoadedModel> {
+function loadOnTarget(model: string, target: RerankExecutionTarget, observeFallback?: LocalRerankOptions['observeFallback']): Promise<LoadedModel> {
   const effective = target.device !== 'cpu' && _gpuUnusable ? CPU_EXECUTION_TARGET : target;
+  if (target.device !== 'cpu' && _gpuUnusable) {
+    try { observeFallback?.('rerank-device', { eligible: 1, applied: 0, reason: 'sticky-gpu-demotion' }); } catch { /* no-throw sink */ }
+  }
   const key = `${model}::${effective.dtype}::${effective.device}`;
 
   const cached = _models.get(key);
   if (cached) return cached;
 
-  const loading = (_loaderOverride ?? defaultLoader)(model, effective.dtype, effective.device).catch(
+  const loading = (_loaderOverride ?? defaultLoader)(model, effective.dtype, effective.device).then((loaded) => {
+    if (effective.device !== 'cpu') {
+      try { observeFallback?.('rerank-device', { eligible: 1, applied: 1, reason: 'applied' }); } catch { /* no-throw sink */ }
+    }
+    return loaded;
+  }).catch(
     (err) => {
       _models.delete(key);
       if (effective.device === 'cpu') throw err;
       // Demote the WHOLE pair, once, then retry on CPU.
       _gpuUnusable = true;
-      reportDemotion(effective, err);
+      reportDemotion(effective, err, observeFallback);
       return loadOnTarget(model, CPU_EXECUTION_TARGET);
     },
   );
@@ -476,7 +487,7 @@ async function scoreCrossEncoderUngated(
     const target = effectiveTarget(opts);
     const effective = target.device !== 'cpu' && _gpuUnusable ? CPU_EXECUTION_TARGET : target;
     try {
-      return await scoreViaWorker({
+      const scores = await scoreViaWorker({
         query,
         texts,
         model: opts.model ?? LOCAL_RERANKER_MODEL,
@@ -485,14 +496,19 @@ async function scoreCrossEncoderUngated(
         maxLength: opts.maxLength ?? DEFAULT_MAX_LENGTH,
         batchSize: Math.max(1, opts.batchSize ?? DEFAULT_BATCH_SIZE),
         deadline: opts.deadline,
+        ...(opts.observeFallback ? { observeFallback: opts.observeFallback } : {}),
       });
+      try { opts.observeFallback?.('rerank-worker', { eligible: 1, applied: 1, reason: 'applied' }); } catch { /* no-throw sink */ }
+      return scores;
     } catch (err) {
       // A deadline expiry is a real verdict from the worker, not a worker
       // fault: re-running it inline would burn the very budget that just
       // expired, on the main thread, which is the opposite of the fix.
       if (isDeadlineFailure(err)) throw err;
-      warnRerankFallback(err);
+      warnRerankFallback(err, opts.observeFallback);
     }
+  } else if (_loaderOverride === null || _workerWithLoaderForTest) {
+    try { opts.observeFallback?.('rerank-worker', { eligible: 1, applied: 0, reason: 'worker-disabled' }); } catch { /* no-throw sink */ }
   }
 
   return await scoreCrossEncoderInline(query, texts, opts);
