@@ -28,7 +28,11 @@
  * deliberate trade the local embedder's worker script already makes.
  */
 
-import { parentPort } from 'node:worker_threads';
+import { parentPort, workerData } from 'node:worker_threads';
+import { mkdirSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 /** Mirrored from local-engine.ts — see WI-3792. ONNX Runtime otherwise grows a
  *  spin-waiting thread pool sized to EVERY core, per loading process. */
@@ -38,13 +42,44 @@ const ORT_SESSION_OPTIONS = { intraOpNumThreads: 4, interOpNumThreads: 1 };
  *  milliseconds, so this cache is the difference between usable and unusable. */
 const modelsByKey = new Map();
 
+// Test seams allow a self-contained fake Transformers module and package tree;
+// production resolves the installed package from this worker script.
+const TRANSFORMERS_SPECIFIER =
+  (workerData && typeof workerData.transformersSpecifier === 'string' && workerData.transformersSpecifier) ||
+  '@huggingface/transformers';
+
+function configureTransformersCache(t) {
+  const packageRoot = workerData && typeof workerData.transformersPackageRoot === 'string'
+    ? workerData.transformersPackageRoot
+    : dirname(dirname(createRequire(import.meta.url).resolve('@huggingface/transformers')));
+  const papercuspHome = process.env.PAPERCUSP_HOME || join(homedir(), '.papercusp');
+  const cacheDir = join(papercuspHome, 'cache', 'transformers');
+  mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+  t.env.localModelPath = join(packageRoot, '.cache');
+  t.env.cacheDir = cacheDir;
+}
+
+let transformersPromise = null;
+function loadTransformers() {
+  if (!transformersPromise) {
+    transformersPromise = import(TRANSFORMERS_SPECIFIER).then((t) => {
+      configureTransformersCache(t);
+      return t;
+    });
+    transformersPromise.catch(() => {
+      transformersPromise = null;
+    });
+  }
+  return transformersPromise;
+}
+
 async function getModel(model, dtype, device, observeFallback) {
   const key = `${model}::${dtype}::${device}`;
   let loaded = modelsByKey.get(key);
   if (!loaded) {
     // Dynamic import keeps the worker spawn cheap when @huggingface/transformers
     // is not installed — the package only loads on the first score call.
-    loaded = import('@huggingface/transformers').then(async (t) => {
+    loaded = loadTransformers().then(async (t) => {
       const [tokenizer, classifier] = await Promise.all([
         t.AutoTokenizer.from_pretrained(model),
         t.AutoModelForSequenceClassification.from_pretrained(model, {

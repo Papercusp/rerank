@@ -14,10 +14,12 @@
  */
 
 import { execFile } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { Worker } from 'node:worker_threads';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -41,6 +43,47 @@ afterEach(async () => {
   await _resetRerankWorkerForTest();
   _resetBeforeExitHookForTest();
 });
+
+function workerMessages(worker: Worker) {
+  const queued: Record<string, unknown>[] = [];
+  const waiters: Array<{
+    kind: string;
+    resolve: (message: Record<string, unknown>) => void;
+    reject: (error: Error) => void;
+  }> = [];
+  let workerFailure: Error | null = null;
+  worker.on('error', (error) => {
+    workerFailure = error;
+    for (const waiter of waiters.splice(0)) waiter.reject(error);
+  });
+  worker.on('exit', (code) => {
+    if (waiters.length > 0) {
+      const error = new Error(`rerank worker exited with code ${code} before the expected message`);
+      for (const waiter of waiters.splice(0)) waiter.reject(error);
+    }
+  });
+  worker.on('message', (value: unknown) => {
+    if (!value || typeof value !== 'object') return;
+    const message = value as Record<string, unknown>;
+    if (message.kind === 'score_err') {
+      const waiter = waiters.shift();
+      if (waiter) waiter.reject(new Error(String(message.error)));
+      else queued.push(message);
+      return;
+    }
+    const index = waiters.findIndex((waiter) => waiter.kind === message.kind);
+    if (index >= 0) waiters.splice(index, 1)[0]!.resolve(message);
+    else queued.push(message);
+  });
+  return (kind: string) => {
+    if (workerFailure) return Promise.reject(workerFailure);
+    const failureIndex = queued.findIndex((message) => message.kind === 'score_err');
+    if (failureIndex >= 0) return Promise.reject(new Error(String(queued.splice(failureIndex, 1)[0]!.error)));
+    const index = queued.findIndex((message) => message.kind === kind);
+    if (index >= 0) return Promise.resolve(queued.splice(index, 1)[0]!);
+    return new Promise<Record<string, unknown>>((resolve, reject) => waiters.push({ kind, resolve, reject }));
+  };
+}
 
 describe('local rerank worker (real thread)', () => {
   it('shares worker ownership and shutdown across distinct module records', async () => {
@@ -214,5 +257,77 @@ describe('local rerank worker (real thread)', () => {
     // Respawn: a shutdown must not permanently disable the worker path.
     await expect(scoreViaWorker({ ...baseReq })).resolves.toEqual([]);
     expect(getRerankWorkerState().alive).toBe(true);
+  }, 30_000);
+});
+
+describe('local rerank worker Transformers.js cache', () => {
+  it('writes to PAPERCUSP_HOME and keeps installed package cache assets readable', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'rerank-transformers-cache-'));
+    const home = join(root, 'tenant-home');
+    const packageRoot = join(root, 'transformers-package');
+    const packageCache = join(packageRoot, '.cache');
+    const assetPath = join(packageCache, 'fixture', 'config.json');
+    mkdirSync(join(packageCache, 'fixture'), { recursive: true });
+    writeFileSync(assetPath, 'installed-model-asset');
+
+    const fakeModulePath = join(root, 'fake-transformers.mjs');
+    writeFileSync(fakeModulePath, `
+      import { parentPort } from 'node:worker_threads';
+      import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      export const env = {};
+      function record(stage) {
+        const preservedAsset = readFileSync(join(env.localModelPath, 'fixture', 'config.json'), 'utf8');
+        mkdirSync(env.cacheDir, { recursive: true });
+        writeFileSync(join(env.cacheDir, 'worker-write-probe'), 'rerank-cache-write');
+        parentPort.postMessage({ kind: 'cache_config', stage, localModelPath: env.localModelPath, cacheDir: env.cacheDir, preservedAsset });
+      }
+      export class AutoTokenizer {
+        static async from_pretrained() {
+          record('tokenizer');
+          return (_queries, options) => ({ batchSize: options.text_pair.length });
+        }
+      }
+      export class AutoModelForSequenceClassification {
+        static async from_pretrained() {
+          record('model');
+          return async (inputs) => ({ logits: { dims: [inputs.batchSize, 1], data: new Float32Array(inputs.batchSize).fill(0.25) } });
+        }
+      }
+    `);
+
+    const scriptPath = resolve(dirname(fileURLToPath(import.meta.url)), 'local-reranker-worker.script.mjs');
+    const worker = new Worker(scriptPath, {
+      env: { ...process.env, PAPERCUSP_HOME: home },
+      workerData: {
+        transformersSpecifier: pathToFileURL(fakeModulePath).href,
+        transformersPackageRoot: packageRoot,
+      },
+    });
+    const next = workerMessages(worker);
+    try {
+      expect(await next('ready')).toMatchObject({ kind: 'ready' });
+      worker.postMessage({
+        kind: 'score', id: 1, query: 'q', texts: ['candidate'], model: 'fixture/model',
+        dtype: 'q8', device: 'cpu', maxLength: 16, batchSize: 1,
+      });
+      const configA = await next('cache_config');
+      const configB = await next('cache_config');
+      for (const config of [configA, configB]) {
+        expect(config).toMatchObject({
+          localModelPath: packageCache,
+          cacheDir: join(home, 'cache', 'transformers'),
+          preservedAsset: 'installed-model-asset',
+        });
+      }
+      expect(new Set([configA.stage, configB.stage])).toEqual(new Set(['tokenizer', 'model']));
+      expect(await next('score_ok')).toMatchObject({ kind: 'score_ok', id: 1, scores: [expect.any(Number)] });
+      expect(readFileSync(join(home, 'cache', 'transformers', 'worker-write-probe'), 'utf8'))
+        .toBe('rerank-cache-write');
+      expect(readFileSync(assetPath, 'utf8')).toBe('installed-model-asset');
+    } finally {
+      await worker.terminate();
+      rmSync(root, { recursive: true, force: true });
+    }
   }, 30_000);
 });
