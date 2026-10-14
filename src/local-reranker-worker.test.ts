@@ -298,6 +298,8 @@ describe('local rerank worker Transformers.js cache', () => {
 
     const scriptPath = resolve(dirname(fileURLToPath(import.meta.url)), 'local-reranker-worker.script.mjs');
     const worker = new Worker(scriptPath, {
+      // `test:file` may place committed-source-loader in process.execArgv; this test must run the worker under test.
+      execArgv: [],
       env: { ...process.env, PAPERCUSP_HOME: home },
       workerData: {
         transformersSpecifier: pathToFileURL(fakeModulePath).href,
