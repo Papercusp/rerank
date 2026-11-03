@@ -246,6 +246,29 @@ describe('local rerank worker (real thread)', () => {
     }
   }, 120_000);
 
+  it.each([
+    { label: 'equals', flags: ['--input-type=module'] },
+    { label: 'separate argument', flags: ['--input-type', 'module'] },
+  ])('starts a real file worker from an ESM stdin parent ($label)', async ({ flags }) => {
+    const moduleUrl = pathToFileURL(resolve(__dirname, 'local-reranker-worker.ts')).href;
+    const program = `
+      const imported = await import(${JSON.stringify(moduleUrl)});
+      const bridge = imported.default ?? imported;
+      try {
+        const scores = await bridge.scoreViaWorker(${JSON.stringify(baseReq)});
+        console.log(JSON.stringify({ scores, worker: bridge.getRerankWorkerState() }));
+      } finally { await bridge.shutdownLocalReranker(); }
+    `;
+    const { stdout } = await promisify(execFile)(process.execPath,
+      ['--import', 'tsx', ...flags, '--eval', program],
+      { cwd: resolve(__dirname, '..'), timeout: 30_000 });
+
+    expect(JSON.parse(stdout.trim())).toEqual({
+      scores: [],
+      worker: { alive: true, disabled: false, pendingCount: 0, keepAlive: false },
+    });
+  }, 45_000);
+
   it('shutdown terminates the worker and allows a later respawn', async () => {
     await scoreViaWorker({ ...baseReq });
     expect(getRerankWorkerState().alive).toBe(true);

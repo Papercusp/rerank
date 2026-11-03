@@ -189,7 +189,10 @@ function ensureWorker(): Promise<void> {
       const scriptPath = workerPath();
       // WI-10005090: before the first worker can load (and later release) the binding.
       pinOnnxRuntimeBinding(scriptPath);
-      spawned = new Worker(scriptPath);
+      // This plain ESM worker needs no parent loader or CLI flags. In
+      // particular, inheriting a stdin parent's --input-type rejects file
+      // workers before their ready handshake (as for the embedder worker).
+      spawned = new Worker(scriptPath, { execArgv: [] });
     } catch (err) {
       // Construction failed — genuinely unavailable, not a transient fault.
       state.workerDisabled = true;
