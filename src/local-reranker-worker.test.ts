@@ -388,7 +388,7 @@ describe('local rerank worker Transformers.js cache', () => {
         kind: 'score', id: 4, query: 'query', texts: ['document'],
         model: 'fixture/model', dtype: 'q8', device: 'cpu', maxLength: 4, batchSize: 1,
       });
-      expect(await next('score_err')).toMatchObject({ id: 4, error: expect.stringContaining('cannot retain both pair members') });
+      await expect(next('score_ok')).rejects.toThrow('cannot retain both pair members');
     } finally {
       await worker.terminate();
       rmSync(root, { recursive: true, force: true });
