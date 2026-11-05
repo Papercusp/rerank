@@ -269,13 +269,13 @@ describe('buildSidecarFirstReranker — sidecar REQUIRED', () => {
       .resolves.toEqual([0.8, 0.8, 0.8, 0.8]);
     await Promise.resolve();
     await Promise.resolve();
-    // CONTROL: a recent measured slow request of this exact size is refused.
-    await expect(score('recent-one', ['one'], { deadline: clock + 4000 })).rejects.toThrow(/deadline exceeded/);
+    // CONTROL: recent slow observations of these exact input dimensions refuse.
+    await expect(score('warm', ['one'], { deadline: clock + 4000 })).rejects.toThrow(/deadline exceeded/);
     expect(fetchFn).toHaveBeenCalledTimes(2);
     clock += DEFAULT_SIDECAR_TIMEOUT_MS;
     // A hard refusal cannot keep a stale estimate alive forever. The same
     // short deadline now admits a bounded probe and learns the recovered cost.
-    await expect(score('recovered-one', ['one'], { deadline: clock + 4000 })).resolves.toEqual([0.8]);
+    await expect(score('warm', ['one'], { deadline: clock + 4000 })).resolves.toEqual([0.8]);
     expect(fetchFn).toHaveBeenCalledTimes(3);
   });
 
@@ -321,6 +321,24 @@ describe('buildSidecarFirstReranker — sidecar REQUIRED', () => {
     // Queue admission, not sidecar health, caused the shed: do not flap the
     // transition state or make the benchmark think the sidecar went down.
     expect(transitions).toEqual([]);
+  });
+
+  it.each(['query', 'text'] as const)('does not reuse latency for unseen wire input dimensions (%s)', async dimension => {
+    let clock = 0;
+    const fetchFn = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(init?.body as string) as { query: string; texts: string[] };
+      clock += body.query.length + body.texts.join('').length > 100 ? 400 : 10;
+      return okResponse(body.texts.map(text => text.length));
+    });
+    const score = buildSidecarFirstReranker({ url: 'http://x', now: () => clock,
+      fetchFn: fetchFn as unknown as typeof fetch, maxAttempts: 1 });
+    const first = score(dimension === 'query' ? 'q'.repeat(200) : 'q',
+      [dimension === 'text' ? 'a'.repeat(200) : 'a'], { deadline: 450 });
+    const shorter = score('q', ['a'], { deadline: 450 });
+    await expect(first).resolves.toEqual([dimension === 'text' ? 200 : 1]);
+    await expect(shorter).resolves.toEqual([1]);
+    expect(clock).toBe(410);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 
   it('short-circuits an empty candidate list without a wire call', async () => {
