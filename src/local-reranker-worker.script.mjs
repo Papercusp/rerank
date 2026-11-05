@@ -115,6 +115,42 @@ function scoreFromLogits(row) {
   return sigmoid(positive - negative);
 }
 
+/** Mirrors local-engine.ts's pair allocation. This plain worker cannot import
+ * TypeScript at runtime; real-worker regressions exercise the same boundaries
+ * as the inline engine so an inline-only repair cannot leave this path stale. */
+function boundedCrossEncoderPair(tokenizer, query, text, maxLength) {
+  const pairLength = (q, t) => tokenizer.encode(q, { text_pair: t }).length;
+  const fullLength = pairLength(query, text);
+  if (fullLength <= maxLength) return [query, text];
+
+  const queryIds = tokenizer.encode(query, { add_special_tokens: false });
+  const textIds = tokenizer.encode(text, { add_special_tokens: false });
+  const specialTokens = fullLength - queryIds.length - textIds.length;
+  const available = maxLength - specialTokens;
+  const queryMinimum = queryIds.length ? 1 : 0;
+  const textMinimum = textIds.length ? 1 : 0;
+  if (available < queryMinimum + textMinimum) {
+    throw new RangeError('Rerank maxLength cannot retain both pair members and their special tokens');
+  }
+  let queryKeep = Math.min(queryIds.length, Math.floor(available / 2));
+  let textKeep = Math.min(textIds.length, available - queryKeep);
+  queryKeep = Math.min(queryIds.length, available - textKeep);
+  const decode = ids => tokenizer.decode(ids, {
+    skip_special_tokens: false, clean_up_tokenization_spaces: false,
+  });
+  for (;;) {
+    const q = queryKeep === queryIds.length ? query : decode(queryIds.slice(0, queryKeep));
+    const t = textKeep === textIds.length ? text : decode(textIds.slice(0, textKeep));
+    let excess = pairLength(q, t) - maxLength;
+    if (excess <= 0) return [q, t];
+    while (excess-- > 0) {
+      if (queryKeep > queryMinimum && (queryKeep >= textKeep || textKeep === textMinimum)) queryKeep--;
+      else if (textKeep > textMinimum) textKeep--;
+      else throw new RangeError('Rerank maxLength cannot retain both decoded pair members');
+    }
+  }
+}
+
 async function score(msg) {
   const { query, texts, model, dtype, device, maxLength, batchSize, deadline } = msg;
   if (texts.length === 0) return [];
@@ -147,8 +183,9 @@ async function score(msg) {
     }
 
     const batch = texts.slice(start, start + size);
-    const inputs = tokenizer(new Array(batch.length).fill(query), {
-      text_pair: batch,
+    const pairs = batch.map(text => boundedCrossEncoderPair(tokenizer, query, text, maxLength));
+    const inputs = tokenizer(pairs.map(([q]) => q), {
+      text_pair: pairs.map(([, text]) => text),
       padding: true,
       truncation: true,
       max_length: maxLength,
