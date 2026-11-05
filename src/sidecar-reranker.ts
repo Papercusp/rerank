@@ -154,6 +154,7 @@ export async function sidecarRerankBatch(url: string, opts: SidecarRerankBatchOp
 
 interface SidecarAdmissionEntry {
   pairs: number;
+  costKey: string;
   deadline: number;
   run: () => Promise<unknown>;
   resolve: (value: unknown) => void;
@@ -161,23 +162,25 @@ interface SidecarAdmissionEntry {
 }
 
 interface SidecarAdmissionGate {
-  enqueue<T>(pairs: number, deadline: number, run: () => Promise<T>): Promise<T>;
+  enqueue<T>(pairs: number, deadline: number, run: () => Promise<T>, costKey: string): Promise<T>;
 }
 
 /**
  * The sidecar's default scorer is one serialized inference resource. A
  * per-scorer HTTP queue keeps concurrent callers from piling whole batches
- * into the server FIFO. Recent observations of the SAME batch size can shed
- * a call before it opens a socket. HTTP latency includes fixed queue/ensure
- * costs, so it cannot be divided by pair count and extrapolated to an unseen
- * batch size. Expired observations are unknown, allowing a bounded new sample.
+ * into the server FIFO. Only observations with the same pair count and
+ * wire-capped query/text lengths can shed a call before it opens a socket.
+ * Pair count alone cannot transfer a long passage's cost to a short passage.
+ * HTTP latency also includes fixed queue/ensure costs, so it cannot be divided
+ * by pair count and extrapolated to unseen inputs. Expired observations are
+ * unknown, allowing a bounded new sample.
  * This is deliberately a separate gate from scorer-gate.ts:
  * the latter protects local CPU, while this one protects the remote sidecar.
  */
 function createSidecarAdmissionGate(now: () => number): SidecarAdmissionGate {
   let active = false;
   const waiting: SidecarAdmissionEntry[] = [];
-  const batchCosts = new Map<number, { elapsedMs: number; measuredAt: number }>();
+  const batchCosts = new Map<string, { elapsedMs: number; measuredAt: number }>();
 
   const deadlineError = (entry: SidecarAdmissionEntry, remaining: number, predictedMs: number | null): Error =>
     new RerankDeadlineError(
@@ -193,10 +196,10 @@ function createSidecarAdmissionGate(now: () => number): SidecarAdmissionGate {
 
     const instant = now();
     const remaining = entry.deadline - instant;
-    for (const [pairs, cost] of batchCosts) {
-      if (instant - cost.measuredAt >= DEFAULT_SIDECAR_TIMEOUT_MS) batchCosts.delete(pairs);
+    for (const [key, cost] of batchCosts) {
+      if (instant - cost.measuredAt >= DEFAULT_SIDECAR_TIMEOUT_MS) batchCosts.delete(key);
     }
-    const observed = batchCosts.get(entry.pairs);
+    const observed = batchCosts.get(entry.costKey);
     const predictedMs = observed ? Math.ceil(observed.elapsedMs) : null;
     if (remaining <= 0 || (predictedMs !== null && predictedMs > remaining)) {
       entry.reject(deadlineError(entry, remaining, predictedMs));
@@ -223,8 +226,8 @@ function createSidecarAdmissionGate(now: () => number): SidecarAdmissionGate {
         if (completed) {
           const elapsed = Math.max(0, now() - startedAt);
           if (elapsed > 0 && entry.pairs > 0) {
-            const prior = batchCosts.get(entry.pairs);
-            batchCosts.set(entry.pairs, { elapsedMs: prior ? prior.elapsedMs * 0.3 + elapsed * 0.7 : elapsed,
+            const prior = batchCosts.get(entry.costKey);
+            batchCosts.set(entry.costKey, { elapsedMs: prior ? prior.elapsedMs * 0.3 + elapsed * 0.7 : elapsed,
               measuredAt: now() });
             // Bound bookkeeping even for clients with unusual batch sizes.
             if (batchCosts.size > 128) batchCosts.delete(batchCosts.keys().next().value!);
@@ -236,10 +239,11 @@ function createSidecarAdmissionGate(now: () => number): SidecarAdmissionGate {
   };
 
   return {
-    enqueue<T>(pairs: number, deadline: number, run: () => Promise<T>): Promise<T> {
+    enqueue<T>(pairs: number, deadline: number, run: () => Promise<T>, costKey: string): Promise<T> {
       return new Promise<T>((resolve, reject) => {
         waiting.push({
           pairs,
+          costKey,
           deadline,
           run,
           resolve: (value) => resolve(value as T),
@@ -434,6 +438,12 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
         ? callOpts.deadline
         : Math.min(callOpts.deadline, ownDeadline);
 
+    // Match the payload after the wire seam's length cap. Keep only lengths,
+    // never caller text, and preserve order because scoring batches may pad
+    // differently. An unobserved input shape remains unknown.
+    const costKey = JSON.stringify([Math.min(query.length, SIDECAR_MAX_TEXT_CHARS),
+      texts.map(text => Math.min(text.length, SIDECAR_MAX_TEXT_CHARS))]);
+
     return await admission.enqueue(texts.length, deadline, async () => {
       let lastErr: unknown;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -503,6 +513,6 @@ export function buildSidecarFirstReranker(opts: SidecarFirstRerankerOpts = {}): 
               `(${currentUrl}, ${model}, budget ${timeoutMs}ms) — reranking requires the sidecar; ` +
               'search degrades to retrieval order while it is down',
           );
-    });
+    }, costKey);
   };
 }
