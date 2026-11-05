@@ -308,13 +308,26 @@ describe('local rerank worker Transformers.js cache', () => {
       export class AutoTokenizer {
         static async from_pretrained() {
           record('tokenizer');
-          return (_queries, options) => ({ batchSize: options.text_pair.length });
+          const ids = value => Array.from(value, c => c.codePointAt(0) + 4);
+          const encode = (text, options = {}) => options.add_special_tokens === false
+            ? ids(text) : [1, ...ids(text), 2, ...ids(options.text_pair ?? ''), 3];
+          const decode = values => String.fromCodePoint(...values.map(id => id - 4));
+          return Object.assign((queries, options) => {
+            const inputs = queries.map((query, index) =>
+              encode(query, { text_pair: options.text_pair[index] }).slice(0, options.max_length));
+            parentPort.postMessage({ kind: 'pair_input', queries, texts: options.text_pair, lengths: inputs.map(ids => ids.length) });
+            return { inputs };
+          }, { encode, decode });
         }
       }
       export class AutoModelForSequenceClassification {
         static async from_pretrained() {
           record('model');
-          return async (inputs) => ({ logits: { dims: [inputs.batchSize, 1], data: new Float32Array(inputs.batchSize).fill(0.25) } });
+          return async ({ inputs }) => ({ logits: { dims: [inputs.length, 1], data: inputs.map(ids => {
+            const separator = ids.indexOf(2);
+            const document = separator < 0 ? '' : String.fromCodePoint(...ids.slice(separator + 1).filter(id => id > 3).map(id => id - 4));
+            return document === 'relevant' ? 4 : -4;
+          }) } });
         }
       }
     `);
@@ -350,6 +363,32 @@ describe('local rerank worker Transformers.js cache', () => {
       expect(readFileSync(join(home, 'cache', 'transformers', 'worker-write-probe'), 'utf8'))
         .toBe('rerank-cache-write');
       expect(readFileSync(assetPath, 'utf8')).toBe('installed-model-asset');
+
+      // Exercise the actual worker's tokenizer/model handoff. An inline-only
+      // fix cannot pass this: tail truncation erases both distinct documents.
+      await next('pair_input'); // first cache probe's input
+      worker.postMessage({
+        kind: 'score', id: 2, query: 'long query '.repeat(100), texts: ['relevant', 'unrelated'],
+        model: 'fixture/model', dtype: 'q8', device: 'cpu', maxLength: 32, batchSize: 2,
+      });
+      const longQuery = await next('pair_input');
+      expect(longQuery).toMatchObject({ texts: ['relevant', 'unrelated'], lengths: [32, 32] });
+      expect((longQuery.queries as string[]).every(query => query.length > 0 && query.length < 30)).toBe(true);
+      const distinct = await next('score_ok');
+      expect(distinct).toMatchObject({ id: 2, scores: [1 / (1 + Math.exp(-4)), 1 / (1 + Math.exp(4))] });
+
+      worker.postMessage({
+        kind: 'score', id: 3, query: 'q', texts: ['a'.repeat(100)],
+        model: 'fixture/model', dtype: 'q8', device: 'cpu', maxLength: 12, batchSize: 1,
+      });
+      expect(await next('pair_input')).toMatchObject({ queries: ['q'], texts: ['a'.repeat(8)], lengths: [12] });
+      expect(await next('score_ok')).toMatchObject({ id: 3 });
+
+      worker.postMessage({
+        kind: 'score', id: 4, query: 'query', texts: ['document'],
+        model: 'fixture/model', dtype: 'q8', device: 'cpu', maxLength: 4, batchSize: 1,
+      });
+      expect(await next('score_err')).toMatchObject({ id: 4, error: expect.stringContaining('cannot retain both pair members') });
     } finally {
       await worker.terminate();
       rmSync(root, { recursive: true, force: true });
