@@ -123,10 +123,13 @@ interface LogitsTensor {
   dims: number[];
   data: ArrayLike<number>;
 }
-type Tokenizer = (
+type Tokenizer = ((
   text: string[],
   opts: { text_pair: string[]; padding: boolean; truncation: boolean; max_length: number },
-) => Record<string, unknown>;
+) => Record<string, unknown>) & {
+  encode(text: string, opts?: { text_pair?: string; add_special_tokens?: boolean }): number[];
+  decode(ids: number[], opts?: { skip_special_tokens?: boolean; clean_up_tokenization_spaces?: boolean }): string;
+};
 type SequenceClassifier = (inputs: Record<string, unknown>) => Promise<{ logits: LogitsTensor }>;
 
 interface TransformersModule {
@@ -373,6 +376,45 @@ function yieldToEventLoop(): Promise<void> {
   });
 }
 
+/** Transformers.js truncates the joined pair from the end. A long query can
+ * therefore remove the entire document, giving unrelated documents identical
+ * model inputs. Allocate tokens to both members before building that pair. */
+function boundedCrossEncoderPair(tokenizer: Tokenizer, query: string, text: string, maxLength: number): [string, string] {
+  const pairLength = (q: string, t: string) => tokenizer.encode(q, { text_pair: t }).length;
+  const fullLength = pairLength(query, text);
+  if (fullLength <= maxLength) return [query, text];
+
+  const queryIds = tokenizer.encode(query, { add_special_tokens: false });
+  const textIds = tokenizer.encode(text, { add_special_tokens: false });
+  const specialTokens = fullLength - queryIds.length - textIds.length;
+  const available = maxLength - specialTokens;
+  const queryMinimum = queryIds.length ? 1 : 0;
+  const textMinimum = textIds.length ? 1 : 0;
+  if (available < queryMinimum + textMinimum) {
+    throw new RangeError('Rerank maxLength cannot retain both pair members and their special tokens');
+  }
+  // Trim the longer member first; a short contract keeps its full token budget.
+  let queryKeep = Math.min(queryIds.length, Math.floor(available / 2));
+  let textKeep = Math.min(textIds.length, available - queryKeep);
+  queryKeep = Math.min(queryIds.length, available - textKeep);
+  const decode = (ids: number[]) => tokenizer.decode(ids, {
+    skip_special_tokens: false, clean_up_tokenization_spaces: false,
+  });
+  for (;;) {
+    const q = queryKeep === queryIds.length ? query : decode(queryIds.slice(0, queryKeep));
+    const t = textKeep === textIds.length ? text : decode(textIds.slice(0, textKeep));
+    let excess = pairLength(q, t) - maxLength;
+    if (excess <= 0) return [q, t];
+    // A cut through a byte-level token can re-encode to more tokens. Check the
+    // actual rebuilt pair rather than assuming decode/encode is lossless.
+    while (excess-- > 0) {
+      if (queryKeep > queryMinimum && (queryKeep >= textKeep || textKeep === textMinimum)) queryKeep--;
+      else if (textKeep > textMinimum) textKeep--;
+      else throw new RangeError('Rerank maxLength cannot retain both decoded pair members');
+    }
+  }
+}
+
 /**
  * Score every (query, text) pair. Returns scores index-aligned with `texts`.
  *
@@ -419,10 +461,11 @@ export async function scoreCrossEncoderInline(
     }
 
     const batch = texts.slice(start, start + batchSize);
+    const pairs = batch.map(text => boundedCrossEncoderPair(tokenizer, query, text, maxLength));
     const inputs = tokenizer(
       // The cross-encoder scores a PAIR: the query is repeated against each doc.
-      new Array(batch.length).fill(query),
-      { text_pair: batch, padding: true, truncation: true, max_length: maxLength },
+      pairs.map(([q]) => q),
+      { text_pair: pairs.map(([, text]) => text), padding: true, truncation: true, max_length: maxLength },
     );
     const { logits } = await model(inputs);
 

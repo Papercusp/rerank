@@ -19,6 +19,7 @@
  * with no ONNX and no model download; the fake fails exactly the GPU attempt.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { withTestTokenEncoding } from './test-tokenizer';
 
 import { CPU_EXECUTION_TARGET, RERANK_DEVICE_ENV } from './execution-target';
 import {
@@ -36,7 +37,7 @@ function loaderFailingOnGpu() {
   return async (_model: string, _dtype: string, device: string) => {
     if (device !== 'cpu') throw new Error(GPU_LOAD_FAILURE);
     return {
-      tokenizer: ((text: string[], o: { text_pair: string[] }) => ({ __texts: o.text_pair })) as never,
+      tokenizer: withTestTokenEncoding((text: string[], o: { text_pair: string[] }) => ({ __texts: o.text_pair })) as never,
       model: (async (inputs: Record<string, unknown>) => {
         const texts = inputs.__texts as string[];
         return { logits: { dims: [texts.length, 1], data: texts.map(() => 0) } };

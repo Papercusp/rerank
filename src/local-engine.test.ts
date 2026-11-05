@@ -12,6 +12,7 @@
  * outage degrade to retrieval order instead of breaking search.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { withTestTokenEncoding } from './test-tokenizer';
 
 import {
   DEFAULT_MAX_LENGTH,
@@ -51,7 +52,7 @@ function fakeLoader(opts: {
     if (opts.loadError) throw opts.loadError;
     const numLabels = opts.numLabels ?? 1;
     return {
-      tokenizer: ((text: string[], o: Omit<TokenizeCall, 'text'>) => {
+      tokenizer: withTestTokenEncoding((text: string[], o: Omit<TokenizeCall, 'text'>) => {
         calls.tokenize.push({ text, ...o });
         return { __texts: o.text_pair };
       }) as never,
@@ -80,6 +81,31 @@ afterEach(() => {
 });
 
 describe('scoreCrossEncoder', () => {
+  it('retains distinct short documents when a long query would consume the whole token limit', async () => {
+    _setLoaderForTest(fakeLoader({ logitsFor: texts => texts.map(t => t === 'relevant' ? 4 : -4) }));
+    const scores = await scoreCrossEncoder('long query '.repeat(100), ['relevant', 'unrelated'], { maxLength: 32 });
+    expect(scores).toEqual([sigmoid(4), sigmoid(-4)]);
+    expect(calls.tokenize[0].text_pair).toEqual(['relevant', 'unrelated']);
+    calls.tokenize[0].text.forEach((q, index) => {
+      expect(q.length).toBeGreaterThan(0);
+      expect(Array.from(q).length + calls.tokenize[0].text_pair[index].length + 3).toBeLessThanOrEqual(32);
+    });
+  });
+
+  it('keeps a short query intact and leaves document tokens when the document needs truncation', async () => {
+    _setLoaderForTest(fakeLoader({}));
+    await scoreCrossEncoder('q', ['a'.repeat(100)], { maxLength: 12 });
+    expect(calls.tokenize[0].text).toEqual(['q']);
+    expect(calls.tokenize[0].text_pair).toEqual(['a'.repeat(8)]);
+  });
+
+  it('refuses a token limit too small to retain both pair members', async () => {
+    _setLoaderForTest(fakeLoader({}));
+    await expect(scoreCrossEncoder('query', ['document'], { maxLength: 4 }))
+      .rejects.toThrow('cannot retain both pair members');
+    expect(calls.forward).toEqual([]);
+  });
+
   it('pairs the query against every doc and returns index-aligned sigmoid scores', async () => {
     _setLoaderForTest(fakeLoader({ logitsFor: (t) => t.map((x) => (x === 'relevant' ? 4 : -4)) }));
 

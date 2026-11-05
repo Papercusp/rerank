@@ -11,6 +11,7 @@
  * need a fresh constructor call use distinct keys.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { withTestTokenEncoding } from './test-tokenizer';
 
 const h = vi.hoisted(() => ({
   rerankCalls: [] as Array<Record<string, unknown>>,
@@ -77,7 +78,7 @@ describe('rerankAvailable', () => {
 describe('engine dispatch', () => {
   /** Fake cross-encoder: scores by the doc text, so ordering is assertable. */
   const loaderScoring = (byText: Record<string, number>) => async () => ({
-    tokenizer: ((_text: string[], o: { text_pair: string[] }) => ({ __texts: o.text_pair })) as never,
+    tokenizer: withTestTokenEncoding((_text: string[], o: { text_pair: string[] }) => ({ __texts: o.text_pair })) as never,
     model: (async (inputs: Record<string, unknown>) => {
       const texts = inputs.__texts as string[];
       return { logits: { dims: [texts.length, 1], data: texts.map((t) => byText[t] ?? 0) } };
@@ -132,7 +133,7 @@ describe('engine dispatch', () => {
 
     /** A cross-encoder whose forward pass BLOCKS the event loop, as ONNX does. */
     const blockingLoader = (counter: { batches: number }) => async () => ({
-      tokenizer: ((_t: string[], o: { text_pair: string[] }) => ({ __texts: o.text_pair })) as never,
+      tokenizer: withTestTokenEncoding((_t: string[], o: { text_pair: string[] }) => ({ __texts: o.text_pair })) as never,
       model: (async (inputs: Record<string, unknown>) => {
         counter.batches += 1;
         const until = Date.now() + BLOCK_MS;

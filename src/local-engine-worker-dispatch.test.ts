@@ -9,6 +9,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { withTestTokenEncoding } from './test-tokenizer';
 
 const scoreViaWorker = vi.fn();
 const getRerankWorkerState = vi.fn(() => ({ alive: true, disabled: false, pendingCount: 0 }));
@@ -32,7 +33,7 @@ const {
  *  is distinguishable from the worker's, so a test can tell which path ran. */
 function inlineLoader(logit: number) {
   return async () => ({
-    tokenizer: (texts: string[]) => ({ n: texts.length }),
+    tokenizer: withTestTokenEncoding((texts: string[]) => ({ n: texts.length })),
     model: async (inputs: Record<string, unknown>) => ({
       logits: { dims: [inputs.n as number, 1], data: new Array(inputs.n as number).fill(logit) },
     }),
