@@ -90,10 +90,16 @@ describe('local rerank worker (real thread)', () => {
     const { Worker } = await import('node:worker_threads');
     const first = await import('./local-reranker-worker');
     let second: typeof first | undefined;
+    const settledBefore = first.getRerankWorkerState().settledCount;
     const post = vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(() => {});
     const pending = first.scoreViaWorker({ ...baseReq }).catch((error: unknown) => error);
     try {
       await vi.waitFor(() => expect(first.getRerankWorkerState().pendingCount).toBe(1));
+      const waiting = first.getRerankWorkerState();
+      expect(waiting.oldestPendingAgeMs).toEqual(expect.any(Number));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(first.getRerankWorkerState().oldestPendingAgeMs).toBeGreaterThan(waiting.oldestPendingAgeMs!);
+      expect(first.getRerankWorkerState().settledCount).toBe(settledBefore);
       vi.resetModules();
       second = await import('./local-reranker-worker');
       expect(second.scoreViaWorker).not.toBe(first.scoreViaWorker);
@@ -124,6 +130,8 @@ describe('local rerank worker (real thread)', () => {
     expect(getRerankWorkerState().alive).toBe(true);
     expect(getRerankWorkerState().disabled).toBe(false);
     expect(getRerankWorkerState().pendingCount).toBe(0);
+    expect(getRerankWorkerState().oldestPendingAgeMs).toBeNull();
+    expect(getRerankWorkerState().settledCount).toBeGreaterThan(0);
   }, 30_000);
 
   it('reuses ONE persistent worker across calls rather than spawning per request', async () => {
@@ -265,7 +273,8 @@ describe('local rerank worker (real thread)', () => {
 
     expect(JSON.parse(stdout.trim())).toEqual({
       scores: [],
-      worker: { alive: true, disabled: false, pendingCount: 0, keepAlive: false },
+      worker: { alive: true, disabled: false, pendingCount: 0, settledCount: 1,
+        oldestPendingAgeMs: null, keepAlive: false },
     });
   }, 45_000);
 

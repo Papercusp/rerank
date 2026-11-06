@@ -25,6 +25,7 @@ import { resolve, dirname } from 'node:path';
 import type { RerankDevice } from './execution-target';
 
 interface PendingRequest {
+  startedAtMs: number;
   resolve: (v: number[]) => void;
   reject: (err: Error) => void;
   observeFallback?: ScoreViaWorkerRequest['observeFallback'];
@@ -35,6 +36,7 @@ interface WorkerState {
   workerReady: Promise<void> | null;
   nextId: number;
   pending: Map<number, PendingRequest>;
+  settledCount: number;
   /**
    * Set ONLY for genuine, permanent unavailability — the worker could not be
    * CONSTRUCTED at all (no `worker_threads`, missing script, spawn threw). A
@@ -83,7 +85,7 @@ export type OnnxBindingPin =
 // tsx can evaluate this module through both CJS and ESM in one process.
 // Shutdown and health reads must see the worker started through either loader.
 const state = pinModuleState<WorkerState>('@papercusp/rerank.local-reranker-worker', () => ({
-  worker: null, workerReady: null, nextId: 0, pending: new Map(),
+  worker: null, workerReady: null, nextId: 0, pending: new Map(), settledCount: 0,
   workerDisabled: false, beforeExitHookInstalled: false, beforeExitListener: null,
   refd: false, lastFallbackWarnAt: 0, onnxBindingPin: null,
 }));
@@ -243,6 +245,7 @@ function ensureWorker(): Promise<void> {
           return;
         }
         state.pending.delete(msg.id);
+        state.settledCount += 1;
         // Release the loop as soon as the LAST request settles, so a one-off
         // script exits on its own.
         syncWorkerRef();
@@ -311,7 +314,7 @@ export async function scoreViaWorker(req: ScoreViaWorkerRequest): Promise<number
   const id = state.nextId++;
   return new Promise<number[]>((resolveScore, rejectScore) => {
     const { observeFallback, ...payload } = req;
-    state.pending.set(id, { resolve: resolveScore, reject: rejectScore, observeFallback });
+    state.pending.set(id, { startedAtMs: Date.now(), resolve: resolveScore, reject: rejectScore, observeFallback });
     // Ref BEFORE posting: between the post and the reply the caller is awaiting
     // a Promise, which is not loop work — an unref'd worker would leave the loop
     // looking idle and let `beforeExit` terminate this very request.
@@ -415,6 +418,8 @@ export function getRerankWorkerState(): {
   alive: boolean;
   disabled: boolean;
   pendingCount: number;
+  settledCount: number;
+  oldestPendingAgeMs: number | null;
   /**
    * True while the worker is holding the event loop open — i.e. a request is in
    * flight. Must track `pendingCount > 0` exactly: a `false` here with pending
@@ -423,10 +428,20 @@ export function getRerankWorkerState(): {
    */
   keepAlive: boolean;
 } {
+  let oldestPendingStartedAtMs: number | null = null;
+  for (const pending of state.pending.values()) {
+    if (oldestPendingStartedAtMs === null || pending.startedAtMs < oldestPendingStartedAtMs) {
+      oldestPendingStartedAtMs = pending.startedAtMs;
+    }
+  }
   return {
     alive: state.worker !== null,
     disabled: state.workerDisabled,
     pendingCount: state.pending.size,
+    settledCount: state.settledCount,
+    oldestPendingAgeMs: oldestPendingStartedAtMs === null
+      ? null
+      : Math.max(0, Date.now() - oldestPendingStartedAtMs),
     keepAlive: state.refd,
   };
 }
