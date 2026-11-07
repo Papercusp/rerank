@@ -73,8 +73,8 @@ function loadTransformers() {
   return transformersPromise;
 }
 
-async function getModel(model, dtype, device, observeFallback) {
-  const key = `${model}::${dtype}::${device}`;
+async function getModel(model, dtype, device, observeFallback, threads) {
+  const key = `${model}::${dtype}::${device}::${threads}`;
   let loaded = modelsByKey.get(key);
   if (!loaded) {
     // Dynamic import keeps the worker spawn cheap when @huggingface/transformers
@@ -85,7 +85,7 @@ async function getModel(model, dtype, device, observeFallback) {
         t.AutoModelForSequenceClassification.from_pretrained(model, {
           dtype,
           device,
-          session_options: ORT_SESSION_OPTIONS,
+          session_options: { ...ORT_SESSION_OPTIONS, intraOpNumThreads: threads },
         }),
       ]);
       return { tokenizer, model: classifier };
@@ -154,6 +154,10 @@ function boundedCrossEncoderPair(tokenizer, query, text, maxLength) {
 async function score(msg) {
   const { query, texts, model, dtype, device, maxLength, batchSize, deadline } = msg;
   if (texts.length === 0) return [];
+  const threads = msg.intraOpNumThreads ?? ORT_SESSION_OPTIONS.intraOpNumThreads;
+  if (!Number.isInteger(threads) || threads < 1 || threads > 4) {
+    throw new RangeError('Rerank intraOpNumThreads must be an integer from 1 to 4');
+  }
 
   // Check the deadline BEFORE loading, not just between batches: a model load is
   // seconds on a cold cache, so loading first would spend the entire (already
@@ -166,7 +170,7 @@ async function score(msg) {
   }
 
   const { tokenizer, model: classifier } = await getModel(model, dtype, device, (decision) =>
-    parentPort.postMessage({ kind: 'device_decision', id: msg.id, decision }));
+    parentPort.postMessage({ kind: 'device_decision', id: msg.id, decision }), threads);
   const size = Math.max(1, batchSize);
   const scores = [];
 
