@@ -6,6 +6,27 @@ afterEach(() => {
 });
 
 describe('the default optional transformer loader in a module runner', () => {
+  it('keeps bounded thread settings in session identity rather than reusing a differently configured model', async () => {
+    const modelFactory = vi.fn(async () => ({}));
+    vi.doMock('@huggingface/transformers', () => ({
+      AutoTokenizer: { from_pretrained: async () => ({}) },
+      AutoModelForSequenceClassification: { from_pretrained: modelFactory },
+    }));
+    const engine = await import('./local-engine');
+    const base = { model: 'thread-fixture', device: 'cpu' as const, dtype: 'q8' };
+    const four = await engine.loadCrossEncoder(base);
+    const one = await engine.loadCrossEncoder({ ...base, intraOpNumThreads: 1 });
+    expect(one).not.toBe(four);
+    expect(await engine.loadCrossEncoder({ ...base, intraOpNumThreads: 4 })).toBe(four);
+    expect(await engine.loadCrossEncoder({ ...base, intraOpNumThreads: 1 })).toBe(one);
+    expect(modelFactory.mock.calls.map(call => (call as unknown as [string, { session_options: unknown }])[1].session_options))
+      .toEqual([{ intraOpNumThreads: 4, interOpNumThreads: 1 }, { intraOpNumThreads: 1, interOpNumThreads: 1 }]);
+    for (const intraOpNumThreads of [0, 5, 1.5, NaN, Infinity]) {
+      expect(() => engine.loadCrossEncoder({ ...base, intraOpNumThreads })).toThrow('integer from 1 to 4');
+    }
+    expect(modelFactory).toHaveBeenCalledTimes(2);
+  });
+
   it('detects and loads the installed module without a loader override or model download', async () => {
     const tokenizer = vi.fn(() => ({}));
     const model = vi.fn(async () => ({ logits: { dims: [1, 1], data: [2] } }));

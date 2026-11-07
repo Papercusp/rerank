@@ -154,7 +154,9 @@ export async function runInScorerGate<T>(
   pairs: number,
   deadline: number | undefined,
   fn: () => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
+  signal?.throwIfAborted();
   if (pairs <= 0) return await fn();
 
   if (deadline !== undefined && wouldMissDeadline(pairs, deadline)) {
@@ -162,13 +164,28 @@ export async function runInScorerGate<T>(
   }
 
   await new Promise<void>((admit, refuse) => {
-    _queue.push({ pairs, deadline, admit, refuse });
-    pump();
+    const cleanup = () => signal?.removeEventListener('abort', onAbort);
+    const waiter: Waiter = {
+      pairs, deadline,
+      admit: () => { cleanup(); admit(); },
+      refuse: error => { cleanup(); refuse(error); },
+    };
+    const onAbort = () => {
+      const index = _queue.indexOf(waiter);
+      if (index < 0) return;
+      _queue.splice(index, 1);
+      waiter.refuse(signal!.reason);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    _queue.push(waiter);
+    if (signal?.aborted) onAbort();
+    else pump();
   });
 
   const startedAt = Date.now();
   const soloRun = _active === 1;
   try {
+    signal?.throwIfAborted();
     return await fn();
   } finally {
     const elapsed = Date.now() - startedAt;

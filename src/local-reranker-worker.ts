@@ -300,6 +300,7 @@ export interface ScoreViaWorkerRequest {
   device: RerankDevice;
   maxLength: number;
   batchSize: number;
+  intraOpNumThreads?: number;
   deadline?: number;
 }
 

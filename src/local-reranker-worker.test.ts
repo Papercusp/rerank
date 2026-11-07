@@ -103,7 +103,11 @@ describe('local rerank worker (real thread)', () => {
       vi.resetModules();
       second = await import('./local-reranker-worker');
       expect(second.scoreViaWorker).not.toBe(first.scoreViaWorker);
-      expect(second.getRerankWorkerState()).toEqual(first.getRerankWorkerState());
+      // Both records must observe the same state at the same instant. The
+      // pending-age field otherwise advances between these consecutive reads.
+      const now = vi.spyOn(Date, 'now').mockReturnValue(Date.now());
+      try { expect(second.getRerankWorkerState()).toEqual(first.getRerankWorkerState()); }
+      finally { now.mockRestore(); }
       // Restore delivery first: a worker that owes an answer is retired, not
       // killed (WI-10006567), and the retire request must reach it.
       post.mockRestore();
@@ -308,6 +312,7 @@ describe('local rerank worker Transformers.js cache', () => {
       import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
       import { join } from 'node:path';
       export const env = {};
+      let modelLoads = 0;
       function record(stage) {
         const preservedAsset = readFileSync(join(env.localModelPath, 'fixture', 'config.json'), 'utf8');
         mkdirSync(env.cacheDir, { recursive: true });
@@ -330,13 +335,17 @@ describe('local rerank worker Transformers.js cache', () => {
         }
       }
       export class AutoModelForSequenceClassification {
-        static async from_pretrained() {
+        static async from_pretrained(_model, options) {
           record('model');
-          return async ({ inputs }) => ({ logits: { dims: [inputs.length, 1], data: inputs.map(ids => {
+          const load = ++modelLoads;
+          return async ({ inputs }) => {
+            parentPort.postMessage({ kind: 'model_session', load, threads: options.session_options.intraOpNumThreads });
+            return { logits: { dims: [inputs.length, 1], data: inputs.map(ids => {
             const separator = ids.indexOf(2);
             const document = separator < 0 ? '' : String.fromCodePoint(...ids.slice(separator + 1).filter(id => id > 3).map(id => id - 4));
             return document === 'relevant' ? 4 : -4;
-          }) } });
+          }) } };
+          };
         }
       }
     `);
@@ -398,6 +407,15 @@ describe('local rerank worker Transformers.js cache', () => {
         model: 'fixture/model', dtype: 'q8', device: 'cpu', maxLength: 4, batchSize: 1,
       });
       await expect(next('score_ok')).rejects.toThrow('cannot retain both pair members');
+      for (let i = 0; i < 3; i++) expect(await next('model_session')).toMatchObject({ load: 1, threads: 4 });
+      for (const [index, threads, load] of [[5, 1, 2], [6, 4, 1], [7, 1, 2]]) {
+        worker.postMessage({ ...baseReq, kind: 'score', id: index, texts: ['candidate'],
+          model: 'fixture/model', intraOpNumThreads: threads });
+        expect(await next('score_ok')).toMatchObject({ id: index });
+        expect(await next('model_session')).toMatchObject({ threads, load });
+      }
+      worker.postMessage({ ...baseReq, kind: 'score', id: 8, texts: ['candidate'], intraOpNumThreads: 0 });
+      await expect(next('score_ok')).rejects.toThrow('integer from 1 to 4');
     } finally {
       await worker.terminate();
       rmSync(root, { recursive: true, force: true });

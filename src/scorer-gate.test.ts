@@ -25,6 +25,34 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 afterEach(() => _resetScorerGateForTest());
 
 describe('scorer admission gate', () => {
+  it('removes an abandoned queued scorer before it can consume a released slot', async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const firstStarted = new Promise<void>(resolve => { started = resolve; });
+    const first = runInScorerGate(1, undefined, async () => {
+      started();
+      await new Promise<void>(resolve => { release = resolve; });
+      return 'first';
+    });
+    await firstStarted;
+    const controller = new AbortController();
+    let abandonedRan = false;
+    const abandoned = runInScorerGate(1, undefined, async () => {
+      abandonedRan = true;
+    }, controller.signal);
+    const observed = abandoned.catch(error => error);
+    const reason = new Error('caller left');
+    controller.abort(reason);
+    const queuedAfterAbort = getScorerGateState().queued;
+    release();
+    await expect(first).resolves.toBe('first');
+    expect(await observed).toBe(reason);
+    expect(queuedAfterAbort).toBe(0);
+    expect(abandonedRan).toBe(false);
+    await expect(runInScorerGate(1, undefined, async () => 'healthy')).resolves.toBe('healthy');
+    expect(getScorerGateState()).toMatchObject({ active: 0, queued: 0 });
+  });
+
   it('serializes concurrent callers instead of letting them contend', async () => {
     _setScorerGateConcurrencyForTest(1);
     let inFlight = 0;

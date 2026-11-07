@@ -78,7 +78,23 @@ export const DEFAULT_MAX_LENGTH = 512;
  *  huge batch wastes compute on padding; 16 keeps memory flat and padding cheap. */
 export const DEFAULT_BATCH_SIZE = 16;
 
+export interface LocalRerankTiming {
+  phase: 'admission' | 'scoring';
+  outcome: 'returned' | 'threw';
+  durationMs: number;
+}
+
 export interface LocalRerankOptions {
+  /** Remove an abandoned caller from the shared scorer queue. An already
+   * running native inference drains normally; it is never killed mid-call. */
+  signal?: AbortSignal;
+  /** Bound CPU intra-op parallelism to 1–4 threads; distinct settings use
+   * distinct model sessions. Omitted retains the measured default. */
+  intraOpNumThreads?: number;
+  /** Observation only: distinguish shared scorer waiting from admitted work.
+   * Scoring includes pair preparation/model loading, so warm-up must still be
+   * measured separately before interpreting it as warm inference cost. */
+  onTiming?: (event: LocalRerankTiming) => void;
   /** Optional domain-free host sink for actual device and worker decisions. */
   observeFallback?: (mechanism: string, decision: { eligible: number; applied: number; reason: string }) => unknown;
   /** HF model id. Default `LOCAL_RERANKER_MODEL`. */
@@ -160,7 +176,7 @@ interface LoadedModel {
 const _models = new Map<string, Promise<LoadedModel>>();
 
 /** Injected in tests so the engine's own logic is testable without ONNX. */
-let _loaderOverride: ((model: string, dtype: string, device: RerankDevice) => Promise<LoadedModel>) | null =
+let _loaderOverride: ((model: string, dtype: string, device: RerankDevice, threads: number) => Promise<LoadedModel>) | null =
   null;
 
 /**
@@ -178,14 +194,21 @@ export function _setWorkerWithLoaderForTest(enabled: boolean): void {
   _workerWithLoaderForTest = enabled;
 }
 
-async function defaultLoader(model: string, dtype: string, device: RerankDevice): Promise<LoadedModel> {
+function resolveThreads(threads: number = ORT_SESSION_OPTIONS.intraOpNumThreads): number {
+  if (!Number.isInteger(threads) || threads < 1 || threads > 4) {
+    throw new RangeError('Rerank intraOpNumThreads must be an integer from 1 to 4');
+  }
+  return threads;
+}
+
+async function defaultLoader(model: string, dtype: string, device: RerankDevice, threads: number): Promise<LoadedModel> {
   const transformers = await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
   const [tokenizer, classifier] = await Promise.all([
     transformers.AutoTokenizer.from_pretrained(model),
     transformers.AutoModelForSequenceClassification.from_pretrained(model, {
       dtype,
       device,
-      session_options: ORT_SESSION_OPTIONS,
+      session_options: { ...ORT_SESSION_OPTIONS, intraOpNumThreads: threads },
     }),
   ]);
   return { tokenizer, model: classifier };
@@ -199,7 +222,8 @@ async function defaultLoader(model: string, dtype: string, device: RerankDevice)
  * model, a cold network) does not poison the process for its whole lifetime.
  */
 export function loadCrossEncoder(opts: LocalRerankOptions = {}): Promise<LoadedModel> {
-  return loadOnTarget(opts.model ?? LOCAL_RERANKER_MODEL, effectiveTarget(opts), opts.observeFallback);
+  return loadOnTarget(opts.model ?? LOCAL_RERANKER_MODEL, effectiveTarget(opts), opts.observeFallback,
+    resolveThreads(opts.intraOpNumThreads));
 }
 
 /**
@@ -261,17 +285,17 @@ function reportDemotion(target: RerankExecutionTarget, err: unknown, observeFall
  * provider, which is the single worst configuration available and is exactly
  * what a naive "GPU didn't work, use the CPU" retry produces.
  */
-function loadOnTarget(model: string, target: RerankExecutionTarget, observeFallback?: LocalRerankOptions['observeFallback']): Promise<LoadedModel> {
+function loadOnTarget(model: string, target: RerankExecutionTarget, observeFallback?: LocalRerankOptions['observeFallback'], threads: number = ORT_SESSION_OPTIONS.intraOpNumThreads): Promise<LoadedModel> {
   const effective = target.device !== 'cpu' && _gpuUnusable ? CPU_EXECUTION_TARGET : target;
   if (target.device !== 'cpu' && _gpuUnusable) {
     try { observeFallback?.('rerank-device', { eligible: 1, applied: 0, reason: 'sticky-gpu-demotion' }); } catch { /* no-throw sink */ }
   }
-  const key = `${model}::${effective.dtype}::${effective.device}`;
+  const key = `${model}::${effective.dtype}::${effective.device}::${threads}`;
 
   const cached = _models.get(key);
   if (cached) return cached;
 
-  const loading = (_loaderOverride ?? defaultLoader)(model, effective.dtype, effective.device).then((loaded) => {
+  const loading = (_loaderOverride ?? defaultLoader)(model, effective.dtype, effective.device, threads).then((loaded) => {
     if (effective.device !== 'cpu') {
       try { observeFallback?.('rerank-device', { eligible: 1, applied: 1, reason: 'applied' }); } catch { /* no-throw sink */ }
     }
@@ -283,7 +307,7 @@ function loadOnTarget(model: string, target: RerankExecutionTarget, observeFallb
       // Demote the WHOLE pair, once, then retry on CPU.
       _gpuUnusable = true;
       reportDemotion(effective, err, observeFallback);
-      return loadOnTarget(model, CPU_EXECUTION_TARGET);
+      return loadOnTarget(model, CPU_EXECUTION_TARGET, observeFallback, threads);
     },
   );
   _models.set(key, loading);
@@ -441,6 +465,8 @@ export async function scoreCrossEncoderInline(
   opts: LocalRerankOptions = {},
 ): Promise<number[]> {
   if (texts.length === 0) return [];
+  opts.signal?.throwIfAborted();
+  resolveThreads(opts.intraOpNumThreads);
 
   const { tokenizer, model } = await loadCrossEncoder(opts);
   const maxLength = opts.maxLength ?? DEFAULT_MAX_LENGTH;
@@ -506,6 +532,7 @@ export async function scoreCrossEncoder(
   opts: LocalRerankOptions = {},
 ): Promise<number[]> {
   if (texts.length === 0) return [];
+  resolveThreads(opts.intraOpNumThreads);
 
   // ONE shared scorer, so admission is decided here rather than per engine path:
   // both the worker and the inline fallback contend for the same CPU, and this
@@ -513,9 +540,36 @@ export async function scoreCrossEncoder(
   // measurement — concurrency buys no throughput, so serializing costs nothing
   // and lets a call that provably cannot meet its budget shed at ~0ms instead of
   // spending the whole budget discovering it (WI-37676).
-  return await runInScorerGate(texts.length, opts.deadline, () =>
-    scoreCrossEncoderUngated(query, texts, opts),
-  );
+  if (!opts.onTiming) {
+    return await runInScorerGate(texts.length, opts.deadline, () =>
+      scoreCrossEncoderUngated(query, texts, opts),
+      opts.signal,
+    );
+  }
+  const queuedAt = performance.now();
+  let admitted = false;
+  const report = (phase: LocalRerankTiming['phase'], outcome: LocalRerankTiming['outcome'], startedAt: number) => {
+    try { opts.onTiming?.({ phase, outcome, durationMs: Math.max(0, performance.now() - startedAt) }); }
+    catch { /* diagnostics cannot change scores, admission or errors */ }
+  };
+  try {
+    return await runInScorerGate(texts.length, opts.deadline, async () => {
+      admitted = true;
+      report('admission', 'returned', queuedAt);
+      const startedAt = performance.now();
+      try {
+        const scores = await scoreCrossEncoderUngated(query, texts, opts);
+        report('scoring', 'returned', startedAt);
+        return scores;
+      } catch (error) {
+        report('scoring', 'threw', startedAt);
+        throw error;
+      }
+    }, opts.signal);
+  } catch (error) {
+    if (!admitted) report('admission', 'threw', queuedAt);
+    throw error;
+  }
 }
 
 async function scoreCrossEncoderUngated(
@@ -538,6 +592,7 @@ async function scoreCrossEncoderUngated(
         device: effective.device,
         maxLength: opts.maxLength ?? DEFAULT_MAX_LENGTH,
         batchSize: Math.max(1, opts.batchSize ?? DEFAULT_BATCH_SIZE),
+        intraOpNumThreads: resolveThreads(opts.intraOpNumThreads),
         deadline: opts.deadline,
         ...(opts.observeFallback ? { observeFallback: opts.observeFallback } : {}),
       });
@@ -547,7 +602,7 @@ async function scoreCrossEncoderUngated(
       // A deadline expiry is a real verdict from the worker, not a worker
       // fault: re-running it inline would burn the very budget that just
       // expired, on the main thread, which is the opposite of the fix.
-      if (isDeadlineFailure(err)) throw err;
+      if (opts.signal?.aborted || isDeadlineFailure(err)) throw err;
       warnRerankFallback(err, opts.observeFallback);
     }
   } else if (_loaderOverride === null || _workerWithLoaderForTest) {
