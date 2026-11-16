@@ -183,11 +183,12 @@ let _loaderOverride: ((model: string, dtype: string, device: RerankDevice, threa
  * Test-only: permit the WORKER path even while a loader override is installed.
  *
  * Normally an injected loader forces the inline path (it is an in-process object
- * and cannot cross a thread boundary). That rule makes the worker→inline
- * FALLBACK unreachable from tests, because the override short-circuits before
- * the worker is ever tried — so this seam exists purely to exercise "the worker
- * failed, did we degrade correctly?" against a fake model. Production never
- * installs a loader override, so this combination cannot occur outside tests.
+ * and cannot cross a thread boundary). That rule makes the worker dispatch
+ * unreachable from tests, because the override short-circuits before the worker
+ * is ever tried — so this seam exists purely to exercise "the worker failed or
+ * is disabled, did we degrade correctly?" (reject, never re-run inline:
+ * WI-6554700010050758). Production never installs a loader override, so this
+ * combination cannot occur outside tests.
  */
 let _workerWithLoaderForTest = false;
 export function _setWorkerWithLoaderForTest(enabled: boolean): void {
@@ -454,10 +455,13 @@ function boundedCrossEncoderPair(tokenizer: Tokenizer, query: string, text: stri
  * inline loop yields between batches and re-checks its deadline there, bounding
  * the caller's wait to at most ONE batch of overrun instead of the whole stage.
  *
- * The preferred path takes the third option: `scoreCrossEncoder` dispatches to a
- * WORKER THREAD (`local-reranker-worker.ts`, WI-37555), which makes the caller's
- * bound EXACT rather than bounded-to-one-batch. This inline function remains the
- * fallback for hosts where a worker cannot spawn — degraded, never broken.
+ * Production takes the third option: `scoreCrossEncoder` dispatches to a WORKER
+ * THREAD (`local-reranker-worker.ts`, WI-37555), which makes the caller's bound
+ * EXACT rather than bounded-to-one-batch. This function is NOT a fallback for a
+ * failed or disabled worker (WI-6554700010050758): loading and running the model
+ * here holds the main thread (measured: one 1.08s event-loop gap on a warm
+ * cache), so a worker failure rejects and `localEngineScores` keeps retrieval
+ * order. It serves the `_setLoaderForTest` seam and direct in-process callers.
  */
 export async function scoreCrossEncoderInline(
   query: string,
@@ -518,13 +522,16 @@ export async function scoreCrossEncoderInline(
  * deliberately invisible to them, so the sidecar, the warm-model host and
  * `localEngineScores` all get the exact bound with no wiring change.
  *
- * Two cases take the inline path, both on purpose:
- *  - a `_setLoaderForTest` override is installed. An injected loader is an
- *    in-process JavaScript object; it cannot cross a thread boundary, so
- *    routing it to the worker would not merely fail, it would silently start
- *    exercising the REAL ONNX model in tests that believe they injected a fake.
- *  - the worker is unavailable or failed. Degraded (bound accurate only to one
- *    batch), never broken.
+ * Only one case takes the inline path, on purpose: a `_setLoaderForTest`
+ * override is installed. An injected loader is an in-process JavaScript object;
+ * it cannot cross a thread boundary, so routing it to the worker would not
+ * merely fail, it would silently start exercising the REAL ONNX model in tests
+ * that believe they injected a fake.
+ *
+ * A worker that is disabled or fails REJECTS (WI-6554700010050758). It never
+ * re-runs inline, which would load and run the model on the calling thread.
+ * The engine seam (`localEngineScores`) turns the rejection into `null`, so the
+ * caller keeps retrieval order: degraded, never broken, never blocking.
  */
 export async function scoreCrossEncoder(
   query: string,
@@ -535,7 +542,7 @@ export async function scoreCrossEncoder(
   resolveThreads(opts.intraOpNumThreads);
 
   // ONE shared scorer, so admission is decided here rather than per engine path:
-  // both the worker and the inline fallback contend for the same CPU, and this
+  // the worker and the test-loader inline path contend for the same CPU, and this
   // is the single funnel they both pass through. See `scorer-gate.ts` for the
   // measurement — concurrency buys no throughput, so serializing costs nothing
   // and lets a call that provably cannot meet its budget shed at ~0ms instead of
@@ -577,39 +584,59 @@ async function scoreCrossEncoderUngated(
   texts: string[],
   opts: LocalRerankOptions,
 ): Promise<number[]> {
-  if ((_loaderOverride === null || _workerWithLoaderForTest) && !getRerankWorkerState().disabled) {
-    // Resolve the (device, dtype) pair HERE — including any verified GPU
-    // demotion — so that logic lives in one place rather than being duplicated
-    // across the thread seam.
-    const target = effectiveTarget(opts);
-    const effective = target.device !== 'cpu' && _gpuUnusable ? CPU_EXECUTION_TARGET : target;
-    try {
-      const scores = await scoreViaWorker({
-        query,
-        texts,
-        model: opts.model ?? LOCAL_RERANKER_MODEL,
-        dtype: effective.dtype,
-        device: effective.device,
-        maxLength: opts.maxLength ?? DEFAULT_MAX_LENGTH,
-        batchSize: Math.max(1, opts.batchSize ?? DEFAULT_BATCH_SIZE),
-        intraOpNumThreads: resolveThreads(opts.intraOpNumThreads),
-        deadline: opts.deadline,
-        ...(opts.observeFallback ? { observeFallback: opts.observeFallback } : {}),
-      });
-      try { opts.observeFallback?.('rerank-worker', { eligible: 1, applied: 1, reason: 'applied' }); } catch { /* no-throw sink */ }
-      return scores;
-    } catch (err) {
-      // A deadline expiry is a real verdict from the worker, not a worker
-      // fault: re-running it inline would burn the very budget that just
-      // expired, on the main thread, which is the opposite of the fix.
-      if (opts.signal?.aborted || isDeadlineFailure(err)) throw err;
-      warnRerankFallback(err, opts.observeFallback);
-    }
-  } else if (_loaderOverride === null || _workerWithLoaderForTest) {
-    try { opts.observeFallback?.('rerank-worker', { eligible: 1, applied: 0, reason: 'worker-disabled' }); } catch { /* no-throw sink */ }
+  // Test seam only: an injected fake loader scores in-process (see
+  // `_setLoaderForTest`). Production never installs one.
+  if (_loaderOverride !== null && !_workerWithLoaderForTest) {
+    return await scoreCrossEncoderInline(query, texts, opts);
   }
+  // NO INLINE RETRY (WI-6554700010050758). A disabled or failed worker rejects;
+  // `localEngineScores` turns that into `null` and the caller keeps retrieval
+  // order. Re-running the cross-encoder here would load and run the ONNX model
+  // on the calling (main) thread: measured one 1.08s event-loop gap on a warm
+  // cache, the class EI-28961860650735669 removed from the embedders.
+  if (getRerankWorkerState().disabled) {
+    try { opts.observeFallback?.('rerank-worker', { eligible: 1, applied: 0, reason: 'worker-disabled' }); } catch { /* no-throw sink */ }
+    throw rerankWorkerDisabledError();
+  }
+  // Resolve the (device, dtype) pair HERE — including any verified GPU
+  // demotion — so that logic lives in one place rather than being duplicated
+  // across the thread seam.
+  const target = effectiveTarget(opts);
+  const effective = target.device !== 'cpu' && _gpuUnusable ? CPU_EXECUTION_TARGET : target;
+  try {
+    const scores = await scoreViaWorker({
+      query,
+      texts,
+      model: opts.model ?? LOCAL_RERANKER_MODEL,
+      dtype: effective.dtype,
+      device: effective.device,
+      maxLength: opts.maxLength ?? DEFAULT_MAX_LENGTH,
+      batchSize: Math.max(1, opts.batchSize ?? DEFAULT_BATCH_SIZE),
+      intraOpNumThreads: resolveThreads(opts.intraOpNumThreads),
+      deadline: opts.deadline,
+      ...(opts.observeFallback ? { observeFallback: opts.observeFallback } : {}),
+    });
+    try { opts.observeFallback?.('rerank-worker', { eligible: 1, applied: 1, reason: 'applied' }); } catch { /* no-throw sink */ }
+    return scores;
+  } catch (err) {
+    // A deadline expiry or abort is a real verdict, not a worker fault: it
+    // propagates as-is, without the worker-failure warning.
+    if (opts.signal?.aborted || isDeadlineFailure(err)) throw err;
+    warnRerankFallback(err, opts.observeFallback);
+    throw err;
+  }
+}
 
-  return await scoreCrossEncoderInline(query, texts, opts);
+/**
+ * The rejection for a disabled rerank worker (WI-6554700010050758). Scoring
+ * never retries on the calling thread, so the engine seam returns `null` and
+ * the caller keeps retrieval order.
+ */
+export function rerankWorkerDisabledError(): Error {
+  return new Error(
+    '[rerank] the rerank worker is disabled; cross-encoder inference never runs on the main thread, '
+      + 'so this call rejects and the caller keeps retrieval order',
+  );
 }
 
 /**

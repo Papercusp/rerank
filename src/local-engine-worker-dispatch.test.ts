@@ -26,6 +26,7 @@ const {
   _setLoaderForTest,
   _setWorkerWithLoaderForTest,
   scoreCrossEncoder,
+  localEngineScores,
   DEFAULT_BATCH_SIZE,
   DEFAULT_MAX_LENGTH,
 } = await import('./local-engine');
@@ -187,22 +188,35 @@ describe('scoreCrossEncoder dispatch', () => {
     expect(scoreViaWorker).not.toHaveBeenCalled();
   });
 
-  it('stays INLINE when the worker is permanently unavailable', async () => {
+  it('REJECTS when the worker is disabled and never scores inline (WI-6554700010050758)', async () => {
+    // The disabled branch sits on the worker path: a bare loader override
+    // short-circuits to the test seam before the worker state is consulted.
     getRerankWorkerState.mockReturnValue({ alive: false, disabled: true, pendingCount: 0 });
-    _setLoaderForTest(inlineLoader(7));
+    const loader = vi.fn(inlineLoader(7));
+    _setLoaderForTest(loader);
+    _setWorkerWithLoaderForTest(true); // see its doc — production never combines these
 
-    await expect(scoreCrossEncoder('q', ['a'])).resolves.toEqual([INLINE_SCORE]);
+    await expect(scoreCrossEncoder('q', ['a'])).rejects.toThrow(/rerank worker is disabled/);
     expect(scoreViaWorker).not.toHaveBeenCalled();
+    expect(loader).not.toHaveBeenCalled();
+    await expect(localEngineScores('q', ['a'])).resolves.toBeNull();
   });
 
-  it('falls back to inline scoring when the worker fails, rather than failing the rerank', async () => {
-    _setLoaderForTest(inlineLoader(7));
+  it('REJECTS with the worker error when the worker fails, never retrying inline (WI-6554700010050758)', async () => {
+    // An inline retry would load and run the ONNX model on the calling thread
+    // (measured: one 1.08s event-loop gap on a warm cache). The engine seam
+    // turns the rejection into null, so the caller keeps retrieval order.
+    const loader = vi.fn(inlineLoader(7));
+    _setLoaderForTest(loader);
     _setWorkerWithLoaderForTest(true); // see its doc — production never combines these
-    scoreViaWorker.mockRejectedValue(new Error('worker spawn failed'));
+    const workerError = new Error('worker spawn failed');
+    scoreViaWorker.mockRejectedValue(workerError);
 
-    await expect(scoreCrossEncoder('q', ['a'])).resolves.toEqual([INLINE_SCORE]);
+    await expect(scoreCrossEncoder('q', ['a'])).rejects.toBe(workerError);
     expect(scoreViaWorker).toHaveBeenCalledTimes(1);
     expect(warnRerankFallback).toHaveBeenCalledTimes(1);
+    expect(loader).not.toHaveBeenCalled();
+    await expect(localEngineScores('q', ['a'])).resolves.toBeNull();
   });
 
   it('does NOT re-run inline when the worker reports a deadline expiry', async () => {
