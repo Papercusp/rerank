@@ -14,7 +14,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -416,6 +416,128 @@ describe('local rerank worker Transformers.js cache', () => {
       }
       worker.postMessage({ ...baseReq, kind: 'score', id: 8, texts: ['candidate'], intraOpNumThreads: 0 });
       await expect(next('score_ok')).rejects.toThrow('integer from 1 to 4');
+    } finally {
+      await worker.terminate();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+describe('local rerank worker torn Transformers.js cache (EI-28961860650735669)', () => {
+  // The embedder worker's measured failure (local-embedder-worker.test.ts), on
+  // the cache directory this worker shares: a cached core whose external data
+  // never finished downloading shadows the complete local copy, and ONNX
+  // Runtime cannot find the data beside it, so every load fails.
+  it('drops a cached core whose external data is incomplete, then loads the complete local copy', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'rerank-torn-cache-'));
+    const home = join(root, 'tenant-home');
+    const cacheDir = join(home, 'cache', 'transformers');
+    const packageRoot = join(root, 'transformers-package');
+    const packageCache = join(packageRoot, '.cache');
+    // q8 loads model_quantized.onnx. Its external-data entry is keyed by the
+    // stem without the dtype suffix ('model'), which exercises that fallback.
+    const core = 'model_quantized.onnx';
+    const seed = (base: string, key: string, chunks: number, files: string[]): void => {
+      mkdirSync(join(base, key, 'onnx'), { recursive: true });
+      writeFileSync(join(base, key, 'config.json'),
+        JSON.stringify({ 'transformers.js_config': { use_external_data_format: { model: chunks } } }));
+      for (const file of files) writeFileSync(join(base, key, 'onnx', file), file);
+    };
+    // Complete shipped copies.
+    seed(packageCache, 'fixture/torn', 2, [core, `${core}_data`, `${core}_data_1`]);
+    seed(packageCache, 'fixture/sound', 1, [core, `${core}_data`]);
+    // The torn cache entry: core and first chunk, the second chunk only as partials.
+    const deadPid = 99_999_999; // above Linux pid_max, so kill(pid, 0) is ESRCH
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60_000);
+    const deadStale = `${core}_data_1.tmp.${deadPid}.a1`;
+    const deadFresh = `${core}_data_1.tmp.${deadPid}.b2`;
+    const liveStale = `${core}_data_1.tmp.${process.ppid}.c3`;
+    seed(cacheDir, 'fixture/torn', 2, [core, `${core}_data`, deadStale, deadFresh, liveStale]);
+    const tornOnnx = join(cacheDir, 'fixture/torn', 'onnx');
+    utimesSync(join(tornOnnx, deadStale), twoHoursAgo, twoHoursAgo);
+    utimesSync(join(tornOnnx, liveStale), twoHoursAgo, twoHoursAgo);
+    // A sound cache entry stays and is still served from the cache.
+    seed(cacheDir, 'fixture/sound', 1, [core, `${core}_data`]);
+
+    const fakeModulePath = join(root, 'fake-transformers.mjs');
+    writeFileSync(fakeModulePath, `
+      import { parentPort } from 'node:worker_threads';
+      import { existsSync, readFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      export const env = {};
+      export class AutoTokenizer {
+        static async from_pretrained() {
+          const ids = value => Array.from(value, c => c.codePointAt(0) + 4);
+          const encode = (text, options = {}) => options.add_special_tokens === false
+            ? ids(text) : [1, ...ids(text), 2, ...ids(options.text_pair ?? ''), 3];
+          const decode = values => String.fromCodePoint(...values.map(id => id - 4));
+          return Object.assign((queries, options) => ({
+            inputs: queries.map((query, index) =>
+              encode(query, { text_pair: options.text_pair[index] }).slice(0, options.max_length)),
+          }), { encode, decode });
+        }
+      }
+      // Transformers.js 4.2.0 takes the core file from the cache before the
+      // local copy; ONNX Runtime needs the external data beside that core.
+      export class AutoModelForSequenceClassification {
+        static async from_pretrained(key) {
+          const core = '${core}';
+          const cachedCore = join(env.cacheDir, key, 'onnx', core);
+          const modelDir = existsSync(cachedCore) ? join(env.cacheDir, key) : join(env.localModelPath, key);
+          const config = JSON.parse(readFileSync(join(modelDir, 'config.json'), 'utf8'));
+          const chunks = config['transformers.js_config'].use_external_data_format.model;
+          for (let i = 0; i < chunks; i += 1) {
+            const data = join(modelDir, 'onnx', core + '_data' + (i === 0 ? '' : '_' + i));
+            if (!existsSync(data)) {
+              throw new Error('filesystem error: cannot get file size: No such file or directory [' + data + ']');
+            }
+          }
+          parentPort.postMessage({ kind: 'fixture_loaded', key, modelDir });
+          return async ({ inputs }) => ({ logits: { dims: [inputs.length, 1], data: inputs.map(() => 0) } });
+        }
+      }
+    `);
+
+    const scriptPath = resolve(dirname(fileURLToPath(import.meta.url)), 'local-reranker-worker.script.mjs');
+    const worker = new Worker(scriptPath, {
+      // `test:file` may place committed-source-loader in process.execArgv; this test must run the worker under test.
+      execArgv: [],
+      env: { ...process.env, PAPERCUSP_HOME: home },
+      workerData: {
+        transformersSpecifier: pathToFileURL(fakeModulePath).href,
+        transformersPackageRoot: packageRoot,
+      },
+    });
+    const repairs: unknown[] = [];
+    worker.on('message', (message: { kind?: string }) => {
+      if (message?.kind === 'cache_repair') repairs.push(message);
+    });
+    const next = workerMessages(worker);
+    try {
+      expect(await next('ready')).toMatchObject({ kind: 'ready' });
+      worker.postMessage({ ...baseReq, kind: 'score', id: 1, texts: ['candidate'], model: 'fixture/torn' });
+      expect(await next('cache_repair')).toEqual({
+        kind: 'cache_repair',
+        model: 'fixture/torn',
+        dropped: [{ file: core, missing: [`${core}_data_1`] }],
+        orphans: [deadStale],
+      });
+      expect(await next('fixture_loaded'))
+        .toEqual({ kind: 'fixture_loaded', key: 'fixture/torn', modelDir: join(packageCache, 'fixture/torn') });
+      expect(await next('score_ok')).toMatchObject({ kind: 'score_ok', id: 1, scores: [0.5] });
+      expect(existsSync(join(tornOnnx, core))).toBe(false);
+      expect(existsSync(join(tornOnnx, `${core}_data`))).toBe(true);
+      expect(existsSync(join(tornOnnx, deadStale))).toBe(false);
+      // A partial is kept while its writer may still be alive or writing.
+      expect(existsSync(join(tornOnnx, deadFresh))).toBe(true);
+      expect(existsSync(join(tornOnnx, liveStale))).toBe(true);
+
+      worker.postMessage({ ...baseReq, kind: 'score', id: 2, texts: ['candidate'], model: 'fixture/sound' });
+      expect(await next('fixture_loaded'))
+        .toEqual({ kind: 'fixture_loaded', key: 'fixture/sound', modelDir: join(cacheDir, 'fixture/sound') });
+      expect(await next('score_ok')).toMatchObject({ kind: 'score_ok', id: 2, scores: [0.5] });
+      expect(existsSync(join(cacheDir, 'fixture/sound', 'onnx', core))).toBe(true);
+      expect(repairs).toHaveLength(1);
     } finally {
       await worker.terminate();
       rmSync(root, { recursive: true, force: true });

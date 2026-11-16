@@ -29,7 +29,7 @@
  */
 
 import { parentPort, workerData } from 'node:worker_threads';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -59,6 +59,111 @@ function configureTransformersCache(t) {
   t.env.cacheDir = cacheDir;
 }
 
+/**
+ * EI-28961860650735669: drop a TORN cached model before Transformers.js resolves it.
+ *
+ * MIRRORED from libs/generic/memory/src/local-embedder-worker.script.mjs, which
+ * carries the full measurement. Both worker scripts ship as single copied files
+ * (apps/operator/bin/bundle-host-common.sh), so they cannot share a module: keep
+ * the two copies identical. This worker uses the same cache directory and the
+ * same resolution order, so it fails the same way.
+ *
+ * In short: Transformers.js resolves each model file on its own (FS cache, then
+ * localModelPath, then remote), and ONNX Runtime finds external data beside the
+ * resolved core file. A download killed after the core but before its data
+ * leaves a cached core that can never load and that shadows a complete local
+ * copy. Removing it loses nothing. Orphaned partials are removed only once their
+ * writer pid is gone and they are older than ORPHAN_PARTIAL_MIN_AGE_MS.
+ */
+const DTYPE_FILE_SUFFIXES = ['_fp16', '_int8', '_uint8', '_quantized', '_q4f16', '_q4', '_bnb4'];
+const MAX_EXTERNAL_DATA_CHUNKS = 100; // Transformers.js refuses more.
+const ORPHAN_PARTIAL_MIN_AGE_MS = 30 * 60_000;
+const CACHE_PARTIAL_NAME = /\.tmp\.(\d+)\.[0-9a-z]+$/;
+
+/** Chunk count Transformers.js would request for core `fullName` (0 = no external data). */
+function externalDataChunkCount(format, fullName) {
+  if (!format) return 0;
+  if (typeof format !== 'object') return Math.min(+format || 0, MAX_EXTERNAL_DATA_CHUNKS);
+  const own = (k) => Object.prototype.hasOwnProperty.call(format, k);
+  if (own(fullName)) return Math.min(+format[fullName] || 0, MAX_EXTERNAL_DATA_CHUNKS);
+  // Transformers.js falls back to the file stem without its dtype suffix
+  // (`model_fp16.onnx` -> `model`).
+  const stem = fullName.replace(/\.onnx$/, '');
+  const suffix = DTYPE_FILE_SUFFIXES.find((s) => stem.endsWith(s));
+  const fileName = suffix ? stem.slice(0, -suffix.length) : stem;
+  return own(fileName) ? Math.min(+format[fileName] || 0, MAX_EXTERNAL_DATA_CHUNKS) : 0;
+}
+
+function readJsonFile(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writerIsGone(pid) {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (err) {
+    return Boolean(err && err.code === 'ESRCH');
+  }
+}
+
+/** Returns what was removed, or null when the cached entry was already sound. */
+function dropTornCachedModel(env, key, now = Date.now()) {
+  const cacheDir = env && env.cacheDir;
+  if (!cacheDir || !key) return null;
+  const modelDir = join(cacheDir, key);
+  const onnxDir = join(modelDir, 'onnx');
+  let names;
+  try {
+    names = readdirSync(onnxDir);
+  } catch {
+    return null;
+  }
+  const config = readJsonFile(join(modelDir, 'config.json'))
+    ?? (env.localModelPath ? readJsonFile(join(env.localModelPath, key, 'config.json')) : null);
+  const jsConfig = config && config['transformers.js_config'];
+  const format = jsConfig ? jsConfig.use_external_data_format : undefined;
+  const present = new Set(names);
+  const dropped = [];
+  for (const name of names) {
+    if (!name.endsWith('.onnx')) continue;
+    const missing = [];
+    const chunks = externalDataChunkCount(format, name);
+    for (let i = 0; i < chunks; i += 1) {
+      const dataName = `${name}_data${i === 0 ? '' : `_${i}`}`;
+      if (!present.has(dataName)) missing.push(dataName);
+    }
+    if (missing.length === 0) continue;
+    try {
+      unlinkSync(join(onnxDir, name));
+      dropped.push({ file: name, missing });
+    } catch {
+      // Another process repaired it first, or it is not ours to remove.
+    }
+  }
+  const orphans = [];
+  for (const name of names) {
+    const match = CACHE_PARTIAL_NAME.exec(name);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (pid === process.pid) continue;
+    const path = join(onnxDir, name);
+    try {
+      if (now - statSync(path).mtimeMs < ORPHAN_PARTIAL_MIN_AGE_MS) continue;
+      if (!writerIsGone(pid)) continue;
+      unlinkSync(path);
+      orphans.push(name);
+    } catch {
+      // Raced with its writer finishing, or with another repair.
+    }
+  }
+  return dropped.length > 0 || orphans.length > 0 ? { model: key, dropped, orphans } : null;
+}
+
 let transformersPromise = null;
 function loadTransformers() {
   if (!transformersPromise) {
@@ -80,6 +185,9 @@ async function getModel(model, dtype, device, observeFallback, threads) {
     // Dynamic import keeps the worker spawn cheap when @huggingface/transformers
     // is not installed — the package only loads on the first score call.
     loaded = loadTransformers().then(async (t) => {
+      // Before resolution, so a torn cache entry cannot shadow a loadable copy.
+      const repair = dropTornCachedModel(t.env, model);
+      if (repair) parentPort.postMessage({ kind: 'cache_repair', ...repair });
       const [tokenizer, classifier] = await Promise.all([
         t.AutoTokenizer.from_pretrained(model),
         t.AutoModelForSequenceClassification.from_pretrained(model, {
