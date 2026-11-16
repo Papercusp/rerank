@@ -13,8 +13,9 @@
  * Architecture mirrors `@papercusp/memory`'s `local-embedder-worker.ts`: one
  * persistent worker per process, lazily spawned, holding the warm model(s);
  * main-thread requests marshal a batch over `postMessage` and await a pending
- * Promise keyed by id. Falls back to inline (main-thread) scoring whenever the
- * worker is unavailable — degraded, never broken.
+ * Promise keyed by id. When the worker is unavailable the call rejects and the
+ * engine seam keeps retrieval order — degraded, never broken. Inference never
+ * reruns on the main thread (WI-6554700010050758).
  */
 
 import { pinModuleState } from '@papercusp/module-singleton';
@@ -149,8 +150,9 @@ export function _resetOnnxBindingPinForTest(): void {
  * work, so a host with nothing else ref'd is considered IDLE **mid-request**.
  * `beforeExit` then fires, the hook below terminates the worker, and the exit
  * handler rejects the in-flight request with `rerank worker exited with code 1`
- * — which `scoreCrossEncoder` reads as "the worker is unavailable" and answers
- * by falling back to inline main-thread scoring.
+ * — which `scoreCrossEncoder` read as "the worker is unavailable" and, at the
+ * time, answered by retrying inline on the main thread. That retry is gone
+ * (WI-6554700010050758): the call now rejects.
  *
  * So the whole worker-thread mechanism silently did not apply on any host whose
  * loop is otherwise empty: every CLI, bench and one-off script. Those are
@@ -456,9 +458,11 @@ export function getRerankWorkerState(): {
 }
 
 /**
- * Rate-limited warning for a fall back to inline (main-thread-blocking)
- * scoring. Every call retries the worker (a crashed one respawns), so a
- * SUSTAINED failure would otherwise warn on every single rerank.
+ * Rate-limited warning for a failed worker call. The call rejects and the
+ * engine seam keeps retrieval order; nothing reruns on the main thread
+ * (WI-6554700010050758). Every call retries the worker (a crashed one
+ * respawns), so a SUSTAINED failure would otherwise warn on every single
+ * rerank. The observation is recorded on every failure, before the cooldown.
  */
 const FALLBACK_WARN_COOLDOWN_MS = 30_000;
 export function warnRerankFallback(err: unknown, observeFallback?: (mechanism: string, decision: { eligible: number; applied: number; reason: string }) => unknown): void {
@@ -468,8 +472,8 @@ export function warnRerankFallback(err: unknown, observeFallback?: (mechanism: s
   state.lastFallbackWarnAt = now;
   if (process.env.NODE_ENV !== 'test') {
     console.warn(
-      '[rerank] worker path failed — falling back to inline (main-thread, blocks the event loop) ' +
-        `for this call, so the timeout bound is only accurate to one batch: ${
+      '[rerank] worker path failed — falling back to retrieval order for this call ' +
+        `(no main-thread inference): ${
           err instanceof Error ? err.message : String(err)
         }`,
     );
