@@ -139,6 +139,41 @@ export function _resetOnnxBindingPinForTest(): void {
   state.onnxBindingPin = null;
 }
 
+/** Where the local rerank engine would load from, answered by resolution only. */
+export type LocalRerankEngineResolution =
+  | { status: 'resolvable'; base: string; transformersEntry: string; onnxRuntimeEntry: string }
+  | { status: 'unavailable'; base: string; reason: string };
+
+/**
+ * Is the local rerank engine installed where the reranker worker will load it?
+ * Answered by module RESOLUTION, never by evaluation (WI-6554700010050711).
+ *
+ * Importing `@huggingface/transformers` just to learn "is it installed"
+ * evaluates the package and maps its native dependencies (onnxruntime-node,
+ * sharp) on the calling thread. Measured for the embedder's identical check:
+ * 115-127ms of blocked event loop on a warm page cache, 862ms on a cold one,
+ * once per process. The worker does the real import, so this resolves the same
+ * two packages from the same base the worker and `pinOnnxRuntimeBinding` use:
+ * the worker script. Twin of `resolveLocalEmbedEngine`
+ * (libs/generic/memory/src/local-embedder-worker.ts). A package that resolves
+ * but cannot load is reported resolvable; its real error surfaces from the
+ * worker on the first rerank instead of being mislabelled "not installed".
+ */
+export function resolveLocalRerankEngine(fromPath: string = workerPath()): LocalRerankEngineResolution {
+  let transformersEntry: string;
+  try {
+    transformersEntry = createRequire(fromPath).resolve(TRANSFORMERS_PACKAGE);
+  } catch {
+    return { status: 'unavailable', base: fromPath, reason: `${TRANSFORMERS_PACKAGE} is not resolvable from ${fromPath}` };
+  }
+  try {
+    const onnxRuntimeEntry = createRequire(transformersEntry).resolve('onnxruntime-node');
+    return { status: 'resolvable', base: fromPath, transformersEntry, onnxRuntimeEntry };
+  } catch {
+    return { status: 'unavailable', base: fromPath, reason: `onnxruntime-node is not resolvable from ${transformersEntry}` };
+  }
+}
+
 /**
  * Hold the loop open for EXACTLY as long as a request is in flight, and not one
  * moment longer.

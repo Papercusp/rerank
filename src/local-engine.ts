@@ -28,7 +28,7 @@ import {
   demotedTarget,
   resolveExecutionTarget,
 } from './execution-target';
-import { getRerankWorkerState, scoreViaWorker, warnRerankFallback } from './local-reranker-worker';
+import { getRerankWorkerState, resolveLocalRerankEngine, scoreViaWorker, warnRerankFallback } from './local-reranker-worker';
 import { isDeadlineFailure, runInScorerGate } from './scorer-gate';
 
 /** Cross-encoder that emits one logit per pair. num_labels=1, ModernBERT. */
@@ -658,14 +658,16 @@ export async function localEngineScores(
 }
 
 /** True when a local rerank is possible at all — i.e. the optional ONNX
- *  dependency is installed. Unlike the hosted engine, no key is involved. */
-export async function localRerankAvailable(): Promise<boolean> {
-  try {
-    await dynamicImport<TransformersModule>(TRANSFORMERS_PACKAGE);
-    return true;
-  } catch {
-    return false;
-  }
+ *  dependency is installed where the reranker worker loads it. Unlike the
+ *  hosted engine, no key is involved.
+ *
+ *  Answered by resolution, never by importing the package: an import evaluates
+ *  transformers and maps onnxruntime-node and sharp on the calling thread just
+ *  to learn "is it installed" (WI-6554700010050711; see
+ *  `resolveLocalRerankEngine`). `from` overrides the resolution base, the
+ *  worker script by default. */
+export async function localRerankAvailable(opts: { from?: string } = {}): Promise<boolean> {
+  return resolveLocalRerankEngine(opts.from).status === 'resolvable';
 }
 
 /** Test seam — inject a fake loader and drop every warm model.

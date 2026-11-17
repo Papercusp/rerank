@@ -32,13 +32,17 @@ describe('the default optional transformer loader in a module runner', () => {
     const model = vi.fn(async () => ({ logits: { dims: [1, 1], data: [2] } }));
     const tokenizeFactory = vi.fn(async () => tokenizer);
     const modelFactory = vi.fn(async () => model);
-    vi.doMock('@huggingface/transformers', () => ({
+    const moduleFactory = vi.fn(() => ({
       AutoTokenizer: { from_pretrained: tokenizeFactory },
       AutoModelForSequenceClassification: { from_pretrained: modelFactory },
     }));
+    vi.doMock('@huggingface/transformers', moduleFactory);
     const engine = await import('./local-engine');
     expect(await engine.localRerankAvailable()).toBe(true);
+    // WI-6554700010050711: availability is answered by resolution; it must not evaluate the package.
+    expect(moduleFactory).not.toHaveBeenCalled();
     const loaded = await engine.loadCrossEncoder({ model: 'fixture-model', device: 'cpu', dtype: 'q8' });
+    expect(moduleFactory).toHaveBeenCalledTimes(1);
     expect(loaded.tokenizer).toBe(tokenizer);
     expect(loaded.model).toBe(model);
     expect(tokenizeFactory).toHaveBeenCalledWith('fixture-model');
@@ -51,7 +55,9 @@ describe('the default optional transformer loader in a module runner', () => {
     const missing = Object.assign(new Error('Cannot find optional transformer module'), { code: 'ERR_MODULE_NOT_FOUND' });
     vi.doMock('@huggingface/transformers', () => { throw missing; });
     const engine = await import('./local-engine');
-    expect(await engine.localRerankAvailable()).toBe(false);
+    // Availability resolves rather than imports (WI-6554700010050711), so the
+    // mock cannot make it false; resolve from a base with no install instead.
+    expect(await engine.localRerankAvailable({ from: '/wi0711-no-engine/probe.mjs' })).toBe(false);
     await expect(engine.loadCrossEncoder({ model: 'missing-model', device: 'cpu', dtype: 'q8' }))
       .rejects.toMatchObject({ cause: missing });
   });

@@ -52,8 +52,10 @@ export {
 
 export {
   getRerankWorkerState,
+  resolveLocalRerankEngine,
   scoreViaWorker,
   shutdownLocalReranker,
+  type LocalRerankEngineResolution,
   type ScoreViaWorkerRequest,
 } from './local-reranker-worker';
 
